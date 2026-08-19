@@ -35,6 +35,11 @@ pub fn main(init: std.process.Init) !void {
         .{ "allow rule grants exactly its path", testAllowGrant },
         .{ "wrapped zig: project root allowed", testWrappedZigRootAllowed },
         .{ "moat shell starts clean", testShellStartsClean },
+        .{ "MOAT_ENV_HOME inside root is writable", testEnvHomeInsideRoot },
+        .{ "MOAT_ENV_HOME outside root is refused", testEnvHomeRefused },
+        .{ "MOAT_ENV_HOME outside root works with a write grant", testEnvHomeGranted },
+        .{ "MOAT_ENV_HOME via symlinked /tmp matches its grant", testEnvHomeSymlinked },
+        .{ "MOAT_ENV_HOME is created when missing", testEnvHomeCreated },
     };
 
     var passed: usize = 0;
@@ -229,6 +234,120 @@ fn testStrictDenials(alloc: std.mem.Allocator) !void {
 fn testWrappedZigRootAllowed(alloc: std.mem.Allocator) !void {
     const out = try runInSandbox(alloc, "test-root-allow.sh", try probe(alloc, try std.fmt.allocPrint(alloc, "{s}/src/main.zig", .{flake_path})));
     try expectContains(out, "ACCESSIBLE");
+}
+
+fn runWrappedZig(alloc: std.mem.Allocator, home: []const u8, env_home: ?[]const u8, argv: []const []const u8) !std.process.RunResult {
+    const store_path = try buildZigShell(alloc);
+    var full: std.ArrayList([]const u8) = .empty;
+    try full.append(alloc, try std.fmt.allocPrint(alloc, "{s}/bin/zig", .{store_path}));
+    try full.appendSlice(alloc, argv);
+
+    var env = std.process.Environ.Map.init(alloc);
+    try env.put("HOME", home);
+    try env.put("MOAT_ROOT", flake_path);
+    try env.put("PATH", nixPath());
+    if (env_home) |h| try env.put("MOAT_ENV_HOME", h);
+    return std.process.run(alloc, io, .{ .argv = full.items, .environ_map = &env });
+}
+
+fn testEnvHomeInsideRoot(alloc: std.mem.Allocator) !void {
+    test_counter += 1;
+    const fake = try std.fmt.allocPrint(alloc, "{s}/zig-out/tmp/envhome-{d}", .{ flake_path, test_counter });
+    try std.Io.Dir.cwd().createDirPath(io, fake);
+    defer std.Io.Dir.cwd().deleteTree(io, fake) catch {};
+
+    const src = try std.fmt.allocPrint(alloc, "{s}/hello.zig", .{fake});
+    try writeFile(src, "pub fn main() void {}\n");
+
+    const r = try runWrappedZig(alloc, real_home, fake, &.{
+        "build-exe",                                                    src,
+        try std.fmt.allocPrint(alloc, "-femit-bin={s}/hello", .{fake}),
+    });
+    if (!r.term.success()) {
+        std.debug.print("    stderr: {s}\n", .{r.stderr});
+        return error.EnvHomeBuildFailed;
+    }
+    // The cache only exists if the overridden HOME was actually writable.
+    std.Io.Dir.cwd().access(io, try std.fmt.allocPrint(alloc, "{s}/.cache/zig", .{fake}), .{}) catch
+        return error.NoCacheUnderEnvHome;
+}
+
+fn testEnvHomeRefused(alloc: std.mem.Allocator) !void {
+    const r = try runWrappedZig(alloc, real_home, "/private/tmp/moat-envhome-outside", &.{"version"});
+    if (r.term.success()) {
+        std.debug.print("    expected refusal, got stdout: {s}\n", .{r.stdout});
+        return error.ExpectedRefusal;
+    }
+    try expectContains(r.stderr, "is not writable in the sandbox");
+    try expectContains(r.stderr, "moat allow");
+}
+
+fn testEnvHomeGranted(alloc: std.mem.Allocator) !void {
+    test_counter += 1;
+    const home = try std.fmt.allocPrint(alloc, "/private/tmp/moat-envhome-cfg-{d}", .{test_counter});
+    const fake = try std.fmt.allocPrint(alloc, "/private/tmp/moat-envhome-granted-{d}", .{test_counter});
+    defer std.Io.Dir.cwd().deleteTree(io, home) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, fake) catch {};
+    const cfg_dir = try std.fmt.allocPrint(alloc, "{s}/.config/moat", .{home});
+    try std.Io.Dir.cwd().createDirPath(io, cfg_dir);
+    try std.Io.Dir.cwd().createDirPath(io, fake);
+    try writeFile(
+        try std.fmt.allocPrint(alloc, "{s}/config.zon", .{cfg_dir}),
+        try std.fmt.allocPrint(alloc,
+            \\.{{
+            \\    .allow = .{{.{{ .bin = "*", .paths = .{{"{s}"}}, .write = true }}}},
+            \\}}
+        , .{fake}),
+    );
+
+    const r = try runWrappedZig(alloc, home, fake, &.{"version"});
+    if (!r.term.success()) {
+        std.debug.print("    stderr: {s}\n", .{r.stderr});
+        return error.GrantedEnvHomeRefused;
+    }
+    try expectContains(r.stdout, "0.17.0");
+}
+
+// The grant is canonicalized (/tmp -> /private/tmp); MOAT_ENV_HOME must be too,
+// or following the refusal message's own `moat allow` advice still fails.
+fn testEnvHomeSymlinked(alloc: std.mem.Allocator) !void {
+    test_counter += 1;
+    const home = try std.fmt.allocPrint(alloc, "/tmp/moat-envhome-sym-cfg-{d}", .{test_counter});
+    const fake = try std.fmt.allocPrint(alloc, "/tmp/moat-envhome-sym-{d}", .{test_counter});
+    defer std.Io.Dir.cwd().deleteTree(io, home) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, fake) catch {};
+    const cfg_dir = try std.fmt.allocPrint(alloc, "{s}/.config/moat", .{home});
+    try std.Io.Dir.cwd().createDirPath(io, cfg_dir);
+    try std.Io.Dir.cwd().createDirPath(io, fake);
+    try writeFile(
+        try std.fmt.allocPrint(alloc, "{s}/config.zon", .{cfg_dir}),
+        try std.fmt.allocPrint(alloc,
+            \\.{{
+            \\    .allow = .{{.{{ .bin = "*", .paths = .{{"{s}"}}, .write = true }}}},
+            \\}}
+        , .{fake}),
+    );
+
+    const r = try runWrappedZig(alloc, home, fake, &.{"version"});
+    if (!r.term.success()) {
+        std.debug.print("    stderr: {s}\n", .{r.stderr});
+        return error.SymlinkedEnvHomeRefused;
+    }
+}
+
+// `zig version` never touches HOME, so the directory can only exist if the
+// wrapper made it. A tool that does not mkdir its own dotdirs needs this.
+fn testEnvHomeCreated(alloc: std.mem.Allocator) !void {
+    test_counter += 1;
+    const fake = try std.fmt.allocPrint(alloc, "{s}/zig-out/tmp/envhome-new-{d}", .{ flake_path, test_counter });
+    defer std.Io.Dir.cwd().deleteTree(io, fake) catch {};
+
+    const r = try runWrappedZig(alloc, real_home, fake, &.{"version"});
+    if (!r.term.success()) {
+        std.debug.print("    stderr: {s}\n", .{r.stderr});
+        return error.EnvHomeCreateRunFailed;
+    }
+    std.Io.Dir.cwd().access(io, fake, .{}) catch return error.EnvHomeNotCreated;
 }
 
 fn testShellStartsClean(alloc: std.mem.Allocator) !void {

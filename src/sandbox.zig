@@ -92,7 +92,7 @@ pub fn prepareTmpDir(alloc: std.mem.Allocator, io: std.Io, environ: *std.process
 // profile, so a grant naming a symlinked path (/tmp -> /private/tmp) would
 // never match. Resolve it here; fall back to the literal path when it does not
 // exist yet, which is still correct for an already-canonical path.
-fn canonicalize(alloc: std.mem.Allocator, io: std.Io, path: []const u8) ![]const u8 {
+pub fn canonicalize(alloc: std.mem.Allocator, io: std.Io, path: []const u8) ![]const u8 {
     var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     if (std.Io.Dir.realPathFileAbsolute(io, path, &buf)) |n| {
         return try alloc.dupe(u8, buf[0..n]);
@@ -166,6 +166,19 @@ pub fn validatePath(p: []const u8) !void {
     }
 }
 
+// Root is granted file* by the header; anything else needs a write grant.
+pub fn writableIn(path: []const u8, root: []const u8, grants: []const Grant) bool {
+    if (containsPath(root, path)) return true;
+    for (grants) |g| {
+        if (g.write and containsPath(g.path, path)) return true;
+    }
+    return false;
+}
+
+fn remapNotAbsolute(e: anyerror, as: anyerror) anyerror {
+    return if (e == error.PathNotAbsolute) as else e;
+}
+
 pub fn validateGrant(g: Grant, home: []const u8) !void {
     try validatePath(g.path);
     // A grant of $HOME or an ancestor would undo the whole profile.
@@ -179,13 +192,15 @@ pub const Profile = struct {
     jailbreaks: []const []const u8 = &.{},
 
     pub fn validate(self: Profile) !void {
-        try validatePath(self.root);
-        try validatePath(self.home);
+        validatePath(self.root) catch |e| return remapNotAbsolute(e, error.RootNotAbsolute);
+        validatePath(self.home) catch |e| return remapNotAbsolute(e, error.HomeNotAbsolute);
         if (containsPath(self.root, self.home)) return error.RootContainsHome;
         for (self.grants) |g| try validateGrant(g, self.home);
         // (literal "...") only ever matches an absolute exec path; a bare name
         // silently matches nothing, so refuse it instead of rendering a no-op.
-        for (self.jailbreaks) |path| try validatePath(path);
+        for (self.jailbreaks) |path| {
+            validatePath(path) catch |e| return remapNotAbsolute(e, error.JailbreakNotAbsolute);
+        }
     }
 
     pub fn render(self: Profile, alloc: std.mem.Allocator) ![:0]const u8 {
@@ -194,10 +209,12 @@ pub const Profile = struct {
         for (self.grants) |g| {
             const op = if (g.write) "file*" else "file-read*";
             const line = try std.fmt.allocPrint(alloc, "(allow {s} (subpath \"{s}\"))\n", .{ op, g.path });
+            defer alloc.free(line);
             try buf.appendSlice(alloc, line);
         }
         for (self.jailbreaks) |path| {
             const line = try std.fmt.allocPrint(alloc, "(allow process-exec (literal \"{s}\")(with no-sandbox))\n", .{path});
+            defer alloc.free(line);
             try buf.appendSlice(alloc, line);
         }
         try buf.append(alloc, 0);
@@ -240,7 +257,7 @@ test "profile render" {
     const out = try p.render(alloc);
     defer alloc.free(out);
     try std.testing.expect(std.mem.indexOf(u8, out, "(deny default)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "(allow file* (subpath root))") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "(allow file* process-exec file-map-executable (subpath root))") != null);
 }
 
 test "containsPath" {
@@ -269,6 +286,15 @@ test "grant render and validation" {
     try std.testing.expectError(error.PathUnsafeChars, validateGrant(.{ .path = "/tmp/a\")(allow default)(literal \"x" }, "/Users/test"));
     try std.testing.expectError(error.GrantContainsHome, validateGrant(.{ .path = "/Users/test" }, "/Users/test"));
     try std.testing.expectError(error.GrantContainsHome, validateGrant(.{ .path = "/" }, "/Users/test"));
+}
+
+test "writableIn" {
+    const grants = [_]Grant{ .{ .path = "/tmp/rw", .write = true }, .{ .path = "/tmp/ro" } };
+    try std.testing.expect(writableIn("/work/.moat/home", "/work", &grants));
+    try std.testing.expect(writableIn("/work", "/work", &grants));
+    try std.testing.expect(writableIn("/tmp/rw/home", "/work", &grants));
+    try std.testing.expect(!writableIn("/tmp/ro/home", "/work", &grants));
+    try std.testing.expect(!writableIn("/elsewhere", "/work", &grants));
 }
 
 test "expandTilde" {

@@ -13,12 +13,17 @@ pub fn main(init: std.process.Init) !void {
     const manifest = readManifest(alloc, io, argv0, init.environ_map) catch fatal("cannot read manifest");
     const real_path = lookupManifest(manifest, exe_name) orelse fatal("not in manifest");
 
-    const root = init.environ_map.get("MOAT_ROOT") orelse fatal("MOAT_ROOT not set");
-    const home = init.environ_map.get("HOME") orelse fatal("HOME not set");
+    const root_env = init.environ_map.get("MOAT_ROOT") orelse fatal("MOAT_ROOT not set");
+    const home_env = init.environ_map.get("HOME") orelse fatal("HOME not set");
+
+    // Duped: put() below frees the old value storage these would borrow.
+    const root = try alloc.dupe(u8, root_env);
+    const home = try alloc.dupe(u8, home_env);
 
     // Collect jailbreak list.
     var jailbreaks: std.ArrayList([]const u8) = .empty;
-    if (init.environ_map.get("MOAT_JAILBREAK")) |jb| {
+    if (init.environ_map.get("MOAT_JAILBREAK")) |jb_borrowed| {
+        const jb = try alloc.dupe(u8, jb_borrowed);
         var it = std.mem.splitScalar(u8, jb, ':');
         while (it.next()) |path| {
             if (path.len > 0) try jailbreaks.append(alloc, path);
@@ -28,12 +33,15 @@ pub fn main(init: std.process.Init) !void {
     // Process MOAT_ENV_* variables.
     var to_set: std.ArrayList(struct { key: []const u8, val: []const u8 }) = .empty;
     var to_remove: std.ArrayList([]const u8) = .empty;
+    var env_home: ?[]const u8 = null;
     var env_it = init.environ_map.iterator();
     while (env_it.next()) |entry| {
         if (std.mem.startsWith(u8, entry.key_ptr.*, "MOAT_ENV_")) {
             // Duped: swapRemove below may free the map's own key/value memory.
             const stripped = try alloc.dupe(u8, entry.key_ptr.*["MOAT_ENV_".len..]);
-            try to_set.append(alloc, .{ .key = stripped, .val = try alloc.dupe(u8, entry.value_ptr.*) });
+            const val = try alloc.dupe(u8, entry.value_ptr.*);
+            if (std.mem.eql(u8, stripped, "HOME")) env_home = val;
+            try to_set.append(alloc, .{ .key = stripped, .val = val });
             try to_remove.append(alloc, try alloc.dupe(u8, entry.key_ptr.*));
         }
     }
@@ -77,13 +85,39 @@ pub fn main(init: std.process.Init) !void {
         };
         const grants = try sandbox.collectGrants(alloc, io, loaded.config.allow, exe_name, root, home);
 
+        // An unwritable HOME fails deep inside the tool, so refuse it up front
+        // rather than hand it over.
+        if (env_home) |h_raw| {
+            // Grants are canonicalized, so this must be too or a matching grant
+            // is missed and the message below advises a no-op.
+            const h = try sandbox.canonicalize(alloc, io, h_raw);
+            if (!sandbox.writableIn(h, root, grants)) {
+                std.debug.print(
+                    \\moat-wrapper: MOAT_ENV_HOME={s} is not writable in the sandbox.
+                    \\  Put it under $MOAT_ROOT ({s}), e.g. $MOAT_ROOT/.moat/home,
+                    \\  or grant it explicitly:  moat allow {s} {s} --write
+                    \\
+                , .{ h, root, exe_name, h });
+                std.process.exit(1);
+            }
+        }
+
         sandbox.apply(.{
             .root = root,
             .home = home,
             .grants = grants,
             .jailbreaks = abs_jailbreaks.items,
         }, alloc) catch |err| {
-            std.debug.print("moat-wrapper: cannot apply sandbox: {s}\n", .{@errorName(err)});
+            std.debug.print("moat-wrapper: cannot apply sandbox: {s} (root={s} home={s} grants={d})\n", .{ @errorName(err), root, home, grants.len });
+            std.process.exit(1);
+        };
+    }
+
+    // After the profile is applied, so a failure here is the same failure the
+    // tool would have hit. Covers `moat shell` too, which skips the block above.
+    if (env_home) |h| {
+        std.Io.Dir.cwd().createDirPath(io, h) catch |err| {
+            std.debug.print("moat-wrapper: cannot create MOAT_ENV_HOME={s}: {s}\n", .{ h, @errorName(err) });
             std.process.exit(1);
         };
     }

@@ -138,10 +138,40 @@ Point `MOAT_FLAKE` at your flake and `moat shell rust` just works.
 | `MOAT_FLAKE` | flake reference for shells (default `github:q-uint/moat`) |
 | `MOAT_ROOT` | sandbox boundary; set by `moat shell` |
 | `MOAT_JAILBREAK` | colon-separated binaries that skip the sandbox |
-| `MOAT_ENV_<NAME>` | sets `<NAME>=value` inside the sandbox, then removes the prefixed variable |
+| `MOAT_ENV_<NAME>` | sets `<NAME>=value` inside the sandbox, then removes the prefixed variable (`HOME` is [special-cased](#moat_env_home)) |
 | `TMPDIR` | pointed at `$MOAT_ROOT/.moat/tmp`, since `/tmp` is denied |
 
-`MOAT_ENV_*` is applied by the wrapper before the sandbox is installed, so it can pass values to a wrapped binary without leaking the prefixed name into its environment. For example `MOAT_ENV_HOME=/somewhere` runs the binary with `HOME=/somewhere`.
+`MOAT_ENV_*` is applied by the wrapper before the sandbox is installed, so it can pass values to a wrapped binary without leaking the prefixed name into its environment. For example `MOAT_ENV_FOO=bar` runs the binary with `FOO=bar`.
+
+### MOAT_ENV_HOME
+
+Many tools keep a cache or config under `$HOME`, which the sandbox denies. Pointing `HOME` somewhere writable is the usual fix:
+
+```bash
+MOAT_ENV_HOME=$MOAT_ROOT/.moat/home zig build
+```
+
+Without it, a tool that needs its home cache fails on a path it cannot reach:
+
+```
+error: unable to open global cache directory "/Users/you/.cache/zig": PermissionDenied
+```
+
+`MOAT_ENV_HOME` is refused unless the path is actually writable inside the sandbox: either under `$MOAT_ROOT`, or covered by a write grant. A fake `HOME` the tool cannot write to breaks it further in, with an error that points at the tool rather than at the override. The refusal names both ways out:
+
+```
+moat-wrapper: MOAT_ENV_HOME=/private/tmp/elsewhere is not writable in the sandbox.
+  Put it under $MOAT_ROOT (/Users/you/git/project), e.g. $MOAT_ROOT/.moat/home,
+  or grant it explicitly:  moat allow zig /private/tmp/elsewhere --write
+```
+
+The directory is created if missing, so tools that expect `$HOME` to exist but do not create it work too.
+
+`$MOAT_ROOT/.moat/home` is the suggested location: it sits inside the root, so it is writable without a grant, and `.moat/.gitignore` already ignores its own contents.
+
+Only the real `HOME` is used to find `~/.config/moat/config.zon` and to check that the root does not contain home. An override cannot satisfy those guards.
+
+Inside `moat shell` the session profile is already active and the wrapper does not compile its own, so the writability check is skipped there; the override and the directory creation still apply.
 
 ## Development
 

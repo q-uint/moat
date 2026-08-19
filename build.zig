@@ -52,9 +52,26 @@ pub fn build(b: *std.Build) void {
     });
     linkSandbox(cli_test_mod, b);
 
+    // Tests only run from a module's root file; without its own module here a
+    // test-carrying file is silently never built.
+    const sandbox_unit_mod = b.createModule(.{
+        .root_source_file = b.path("src/sandbox.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    linkSandbox(sandbox_unit_mod, b);
+
+    const config_unit_mod = b.createModule(.{
+        .root_source_file = b.path("src/config.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = wrapper_test_mod })).step);
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = cli_test_mod })).step);
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = sandbox_unit_mod })).step);
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = config_unit_mod })).step);
 
     const sandbox_test_mod = b.createModule(.{
         .root_source_file = b.path("src/test_sandbox.zig"),
