@@ -1,9 +1,18 @@
 { pkgs, wrapper }:
 
 {
-  wrap = { name, paths }:
-    pkgs.runCommand "moat-${name}" { inherit paths; } ''
+  # env values may use $MOAT_ROOT, which the wrapper substitutes; the caller can
+  # still override any of them with MOAT_ENV_<NAME>.
+  wrap = { name, paths, env ? {} }:
+    pkgs.runCommand "moat-${name}" {
+      inherit paths;
+      envLines = pkgs.lib.concatStringsSep "\n"
+        (pkgs.lib.mapAttrsToList (k: v: "${k}=${v}") env);
+    } ''
       mkdir -p $out/bin $out/share/moat
+      if [ -n "$envLines" ]; then
+        printf '%s\n' "$envLines" > $out/share/moat/env
+      fi
       # Always present: a wrapper with no manifest fails with "cannot read
       # manifest" instead of the accurate "not in manifest".
       touch $out/share/moat/manifest

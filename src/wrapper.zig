@@ -2,6 +2,7 @@ const std = @import("std");
 const config = @import("config.zig");
 const sandbox = @import("sandbox.zig");
 const confirm = @import("confirm.zig");
+const shell_env = @import("shell_env.zig");
 
 pub fn main(init: std.process.Init) !void {
     const alloc = init.gpa;
@@ -11,10 +12,15 @@ pub fn main(init: std.process.Init) !void {
     const argv0 = args_it.next() orelse fatal("no argv[0]");
 
     const exe_name = std.fs.path.basename(argv0);
-    const manifest = readManifest(alloc, io, argv0, init.environ_map) catch fatal("cannot read manifest");
+    const share = shareDir(alloc, io, argv0, init.environ_map) catch fatal("cannot locate share/moat");
+    const manifest = readShareFile(alloc, io, share, "manifest") catch fatal("cannot read manifest") orelse fatal("cannot read manifest");
     const real_path = lookupManifest(manifest, exe_name) orelse fatal("not in manifest");
 
-    const root_env = init.environ_map.get("MOAT_ROOT") orelse fatal("MOAT_ROOT not set");
+    const root_env = init.environ_map.get("MOAT_ROOT") orelse fatal(
+        \\MOAT_ROOT not set
+        \\  a wrapped binary needs the sandbox boundary, e.g.
+        \\  MOAT_ROOT="$PWD" <binary>, or run it under `moat run -- <binary>`
+    );
     const home_env = init.environ_map.get("HOME") orelse fatal("HOME not set");
 
     // Duped: put() below frees the old value storage these would borrow.
@@ -31,10 +37,22 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
+    var env_home: ?[]const u8 = null;
+
+    // The shell declares what its tools need (a redirected HOME, a cache dir),
+    // so the knowledge travels with the shell instead of living in a shell rc.
+    // Applied before MOAT_ENV_*, which the caller uses to override it.
+    if (try readShareFile(alloc, io, share, "env")) |content| {
+        const pairs = try shell_env.parse(alloc, content, root);
+        for (pairs) |p| {
+            if (std.mem.eql(u8, p.key, "HOME")) env_home = p.value;
+            try init.environ_map.put(p.key, p.value);
+        }
+    }
+
     // Process MOAT_ENV_* variables.
     var to_set: std.ArrayList(struct { key: []const u8, val: []const u8 }) = .empty;
     var to_remove: std.ArrayList([]const u8) = .empty;
-    var env_home: ?[]const u8 = null;
     var env_it = init.environ_map.iterator();
     while (env_it.next()) |entry| {
         if (std.mem.startsWith(u8, entry.key_ptr.*, "MOAT_ENV_")) {
@@ -149,7 +167,18 @@ pub fn main(init: std.process.Init) !void {
     });
 }
 
-fn readManifest(alloc: std.mem.Allocator, io: std.Io, argv0: []const u8, environ: *std.process.Environ.Map) ![]const u8 {
+// Absent is not an error: only `manifest` is required, and the caller decides.
+fn readShareFile(alloc: std.mem.Allocator, io: std.Io, share: []const u8, name: []const u8) !?[]const u8 {
+    const path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ share, name });
+    var buf: [1024 * 1024]u8 = undefined;
+    const content = std.Io.Dir.cwd().readFile(io, path, &buf) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    return try alloc.dupe(u8, content);
+}
+
+fn shareDir(alloc: std.mem.Allocator, io: std.Io, argv0: []const u8, environ: *std.process.Environ.Map) ![]const u8 {
     // Resolve argv[0] to absolute path so we can find the manifest
     // relative to the symlink's location (not the wrapper binary's location).
     const abs_argv0 = if (std.fs.path.isAbsolute(argv0))
@@ -175,10 +204,7 @@ fn readManifest(alloc: std.mem.Allocator, io: std.Io, argv0: []const u8, environ
         return error.ManifestNotFound;
     };
     const bin_dir = std.fs.path.dirname(abs_argv0) orelse return error.ManifestNotFound;
-    const manifest_path = try std.fmt.allocPrint(alloc, "{s}/../share/moat/manifest", .{bin_dir});
-    var buf: [1024 * 1024]u8 = undefined;
-    const content = try std.Io.Dir.cwd().readFile(io, manifest_path, &buf);
-    return try alloc.dupe(u8, content);
+    return try std.fmt.allocPrint(alloc, "{s}/../share/moat", .{bin_dir});
 }
 
 fn lookupManifest(manifest: []const u8, name: []const u8) ?[]const u8 {

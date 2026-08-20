@@ -80,6 +80,12 @@ pub fn build(b: *std.Build) void {
     });
     linkSandbox(confirm_unit_mod, b);
 
+    const shell_env_unit_mod = b.createModule(.{
+        .root_source_file = b.path("src/shell_env.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = wrapper_test_mod })).step);
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = cli_test_mod })).step);
@@ -87,6 +93,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = config_unit_mod })).step);
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = denials_unit_mod })).step);
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = confirm_unit_mod })).step);
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = shell_env_unit_mod })).step);
 
     const sandbox_test_mod = b.createModule(.{
         .root_source_file = b.path("src/test_sandbox.zig"),
