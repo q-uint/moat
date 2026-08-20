@@ -71,7 +71,7 @@ pub fn main(init: std.process.Init) !void {
         const path_env = init.environ_map.get("PATH") orelse "";
         var abs_jailbreaks: std.ArrayList([]const u8) = .empty;
         for (jailbreaks.items) |name| {
-            if (try sandbox.resolveJailbreak(alloc, io, path_env, name)) |abs| {
+            if (try sandbox.resolveInPath(alloc, io, path_env, name)) |abs| {
                 try abs_jailbreaks.append(alloc, abs);
             }
         }

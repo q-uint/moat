@@ -67,11 +67,20 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const denials_unit_mod = b.createModule(.{
+        .root_source_file = b.path("src/denials.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+
+
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = wrapper_test_mod })).step);
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = cli_test_mod })).step);
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = sandbox_unit_mod })).step);
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = config_unit_mod })).step);
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = denials_unit_mod })).step);
 
     const sandbox_test_mod = b.createModule(.{
         .root_source_file = b.path("src/test_sandbox.zig"),

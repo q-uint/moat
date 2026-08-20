@@ -115,13 +115,30 @@ pub fn collectGrants(alloc: std.mem.Allocator, io: std.Io, rules: anytype, bin: 
         if (!union_all and !r.matchesBin(bin)) continue;
         for (r.paths) |p| {
             const expanded = try expandTilde(alloc, home, p);
-            try out.append(alloc, .{ .path = try canonicalize(alloc, io, expanded), .write = r.write });
+            try out.append(alloc, .{ .path = try canonicalize(alloc, io, expanded), .write = r.write, .exec = r.exec });
         }
     }
     return out.items;
 }
 
-pub fn resolveJailbreak(alloc: std.mem.Allocator, io: std.Io, path_env: []const u8, name: []const u8) !?[]const u8 {
+// Symlink left unresolved: a wrapped binary is a symlink to moat-wrapper, which
+// locates its manifest relative to the symlink.
+pub fn findInPath(alloc: std.mem.Allocator, io: std.Io, path_env: []const u8, name: []const u8) !?[]const u8 {
+    if (std.mem.indexOfScalar(u8, name, '/') != null) {
+        std.Io.Dir.cwd().access(io, name, .{}) catch return null;
+        return try alloc.dupe(u8, name);
+    }
+    var dirs = std.mem.splitScalar(u8, path_env, ':');
+    while (dirs.next()) |dir| {
+        if (dir.len == 0) continue;
+        const cand = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ dir, name });
+        std.Io.Dir.cwd().access(io, cand, .{}) catch continue;
+        return cand;
+    }
+    return null;
+}
+
+pub fn resolveInPath(alloc: std.mem.Allocator, io: std.Io, path_env: []const u8, name: []const u8) !?[]const u8 {
     var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     if (std.fs.path.isAbsolute(name)) {
         const n = std.Io.Dir.realPathFileAbsolute(io, name, &buf) catch return null;
@@ -149,6 +166,9 @@ pub fn expandTilde(alloc: std.mem.Allocator, home: []const u8, path: []const u8)
 pub const Grant = struct {
     path: []const u8,
     write: bool = false,
+    // file* does not imply process-exec, so a binary under a granted path needs
+    // this to run.
+    exec: bool = false,
 };
 
 // Every path here is interpolated into the profile as an SBPL string literal.
@@ -208,7 +228,8 @@ pub const Profile = struct {
         try buf.appendSlice(alloc, sbpl_header);
         for (self.grants) |g| {
             const op = if (g.write) "file*" else "file-read*";
-            const line = try std.fmt.allocPrint(alloc, "(allow {s} (subpath \"{s}\"))\n", .{ op, g.path });
+            const ex: []const u8 = if (g.exec) " process-exec file-map-executable" else "";
+            const line = try std.fmt.allocPrint(alloc, "(allow {s}{s} (subpath \"{s}\"))\n", .{ op, ex, g.path });
             defer alloc.free(line);
             try buf.appendSlice(alloc, line);
         }
@@ -295,6 +316,18 @@ test "writableIn" {
     try std.testing.expect(writableIn("/tmp/rw/home", "/work", &grants));
     try std.testing.expect(!writableIn("/tmp/ro/home", "/work", &grants));
     try std.testing.expect(!writableIn("/elsewhere", "/work", &grants));
+}
+
+test "exec grant renders process-exec" {
+    const alloc = std.testing.allocator;
+    const p = Profile{ .root = "/Users/test/proj", .home = "/Users/test", .grants = &.{
+        .{ .path = "/Users/test/.rustup", .exec = true },
+        .{ .path = "/Users/test/.cache/zig", .write = true, .exec = true },
+    } };
+    const out = try p.render(alloc);
+    defer alloc.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "(allow file-read* process-exec file-map-executable (subpath \"/Users/test/.rustup\"))") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "(allow file* process-exec file-map-executable (subpath \"/Users/test/.cache/zig\"))") != null);
 }
 
 test "expandTilde" {

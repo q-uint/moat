@@ -19,6 +19,10 @@ pub fn main(init: std.process.Init) !void {
         .{ "unknown command", testUnknownCommand },
         .{ "usage errors exit non-zero", testUsageErrorsExitNonZero },
         .{ "allow round-trip", testAllowRoundTrip },
+        .{ "allow --exec", testAllowExec },
+        .{ "allow merges same path", testAllowMergesSamePath },
+        .{ "allow keeps dir-scoped rule", testAllowKeepsDirScopedRule },
+        .{ "unallow", testUnallow },
         .{ "link and detect", testLinkAndDetect },
         .{ "unlink", testUnlink },
         .{ "link relative path", testLinkRelative },
@@ -27,6 +31,7 @@ pub fn main(init: std.process.Init) !void {
         .{ "check", testCheck },
         .{ "check rejects bad allow", testCheckRejectsBadAllow },
         .{ "verbose flag positions", testVerboseFlag },
+        .{ "run requires -- separator", testRunRequiresSeparator },
     };
 
     var passed: usize = 0;
@@ -107,6 +112,28 @@ fn testUnknownCommand(alloc: std.mem.Allocator) !void {
     if (result.term.success()) return error.ExpectedNonZeroExit;
 }
 
+// Without `--`, the shell names and the command are indistinguishable.
+fn testRunRequiresSeparator(alloc: std.mem.Allocator) !void {
+    const home = try TestHome.init(alloc);
+    defer home.deinit();
+    const cases: []const []const []const u8 = &.{
+        &.{ moat_path, "run" },
+        &.{ moat_path, "run", "zig" },
+        &.{ moat_path, "run", "--" },
+    };
+    for (cases) |argv| {
+        const result = try run(alloc, home.path, argv);
+        if (result.term.success()) return error.ExpectedNonZeroExit;
+        try expectContains(result.stderr, "moat run [name...] -- <cmd>");
+    }
+
+    // With a command but no names, shells are resolved instead of erroring;
+    // this home has none configured, so it fails on that, not on usage.
+    const resolved = try run(alloc, home.path, &.{ moat_path, "run", "--", "ls" });
+    if (resolved.term.success()) return error.ExpectedNonZeroExit;
+    try expectContains(resolved.stderr, "no shells configured");
+}
+
 // Usage errors must be detectable by exit status, not just by their message.
 fn testUsageErrorsExitNonZero(alloc: std.mem.Allocator) !void {
     const home = try TestHome.init(alloc);
@@ -144,6 +171,91 @@ fn testAllowRoundTrip(alloc: std.mem.Allocator) !void {
     var buf: [8192]u8 = undefined;
     const content = try std.Io.Dir.cwd().readFile(io, cfg_path, &buf);
     try expectContains(content, ".gitconfig");
+}
+
+// --write and --exec are independent, so they must not merge into one rule.
+fn testAllowExec(alloc: std.mem.Allocator) !void {
+    const home = try TestHome.init(alloc);
+    defer home.deinit();
+    _ = try run(alloc, home.path, &.{ moat_path, "allow", "cargo", "~/.rustup", "--exec" });
+    _ = try run(alloc, home.path, &.{ moat_path, "allow", "zig", "~/.cache/zig", "--write", "--exec" });
+    _ = try run(alloc, home.path, &.{ moat_path, "allow", "git", "~/.gitconfig" });
+
+    const cfg_path = try std.fmt.allocPrint(alloc, "{s}/.config/moat/config.zon", .{home.path});
+    var buf: [8192]u8 = undefined;
+    const content = try std.Io.Dir.cwd().readFile(io, cfg_path, &buf);
+    try expectContains(content, ".rustup");
+    try expectContains(content, ".exec = true");
+    try expectContains(content, ".write = true");
+    // The read-only rule must not have picked up exec.
+    try expectContains(content, ".gitconfig");
+    var rules = std.mem.splitSequence(u8, content, ".bin");
+    _ = rules.next();
+    while (rules.next()) |r| {
+        if (std.mem.indexOf(u8, r, ".gitconfig") == null) continue;
+        if (std.mem.indexOf(u8, r, ".exec = true") != null) return error.ExecLeakedToReadOnlyRule;
+    }
+}
+
+// Re-granting the same path must widen the existing rule, not stack parallel
+// ones: allows are additive, so duplicates only misdescribe the config.
+fn testAllowMergesSamePath(alloc: std.mem.Allocator) !void {
+    const home = try TestHome.init(alloc);
+    defer home.deinit();
+    _ = try run(alloc, home.path, &.{ moat_path, "allow", "zig", "~/.cache/zig" });
+    _ = try run(alloc, home.path, &.{ moat_path, "allow", "zig", "~/.cache/zig", "--write" });
+    _ = try run(alloc, home.path, &.{ moat_path, "allow", "zig", "~/.cache/zig", "--exec" });
+
+    const cfg_path = try std.fmt.allocPrint(alloc, "{s}/.config/moat/config.zon", .{home.path});
+    var buf: [8192]u8 = undefined;
+    const content = try std.Io.Dir.cwd().readFile(io, cfg_path, &buf);
+
+    const n = std.mem.count(u8, content, "~/.cache/zig");
+    if (n != 1) {
+        std.debug.print("    expected 1 rule for the path, found {d}:\n{s}\n", .{ n, content });
+        return error.DuplicateRules;
+    }
+    try expectContains(content, ".write = true");
+    try expectContains(content, ".exec = true");
+}
+
+// A rule scoped by dirs is a different scope and must survive untouched.
+fn testAllowKeepsDirScopedRule(alloc: std.mem.Allocator) !void {
+    const home = try TestHome.init(alloc);
+    defer home.deinit();
+    const cfg_dir = try std.fmt.allocPrint(alloc, "{s}/.config/moat", .{home.path});
+    try std.Io.Dir.cwd().createDirPath(io, cfg_dir);
+    try writeFile(try std.fmt.allocPrint(alloc, "{s}/config.zon", .{cfg_dir}),
+        \\.{
+        \\    .allow = .{.{ .bin = "zig", .paths = .{"~/.cache/zig"}, .dirs = .{"/Users/x/work"} }},
+        \\}
+    );
+    _ = try run(alloc, home.path, &.{ moat_path, "allow", "zig", "~/.cache/zig", "--write" });
+
+    var buf: [8192]u8 = undefined;
+    const content = try std.Io.Dir.cwd().readFile(io, try std.fmt.allocPrint(alloc, "{s}/config.zon", .{cfg_dir}), &buf);
+    try expectContains(content, "/Users/x/work");
+    try expectContains(content, ".write = true");
+}
+
+fn testUnallow(alloc: std.mem.Allocator) !void {
+    const home = try TestHome.init(alloc);
+    defer home.deinit();
+    _ = try run(alloc, home.path, &.{ moat_path, "allow", "zig", "~/.cache/zig", "--write" });
+
+    // The shell-expanded form names the same rule as the stored tilde form.
+    const expanded = try std.fmt.allocPrint(alloc, "{s}/.cache/zig", .{home.path});
+    const gone = try run(alloc, home.path, &.{ moat_path, "unallow", "zig", expanded });
+    if (!gone.term.success()) return error.UnallowFailed;
+
+    const cfg_path = try std.fmt.allocPrint(alloc, "{s}/.config/moat/config.zon", .{home.path});
+    var buf: [8192]u8 = undefined;
+    const content = try std.Io.Dir.cwd().readFile(io, cfg_path, &buf);
+    if (std.mem.indexOf(u8, content, ".cache/zig") != null) return error.RuleStillPresent;
+
+    // Removing what is not there must be detectable by exit status.
+    const again = try run(alloc, home.path, &.{ moat_path, "unallow", "zig", "~/.cache/zig" });
+    if (again.term.success()) return error.ExpectedNonZeroExit;
 }
 
 fn testLinkAndDetect(alloc: std.mem.Allocator) !void {

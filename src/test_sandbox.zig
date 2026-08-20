@@ -40,6 +40,8 @@ pub fn main(init: std.process.Init) !void {
         .{ "MOAT_ENV_HOME outside root works with a write grant", testEnvHomeGranted },
         .{ "MOAT_ENV_HOME via symlinked /tmp matches its grant", testEnvHomeSymlinked },
         .{ "MOAT_ENV_HOME is created when missing", testEnvHomeCreated },
+        .{ "run executes one command sandboxed", testRunCommand },
+        .{ "run --trace reports the denied path", testRunTraceReportsDenial },
     };
 
     var passed: usize = 0;
@@ -349,6 +351,24 @@ fn testEnvHomeCreated(alloc: std.mem.Allocator) !void {
     }
     std.Io.Dir.cwd().access(io, fake, .{}) catch return error.EnvHomeNotCreated;
 }
+
+fn testRunCommand(alloc: std.mem.Allocator) !void {
+    const r = try runMoat(alloc, real_home, &.{ moat_path, "run", "zig", "--", "zig", "version" });
+    if (!r.term.success()) {
+        std.debug.print("    stderr: {s}\n", .{r.stderr});
+        return error.RunFailed;
+    }
+    try expectContains(r.stdout, "0.17.0");
+}
+
+fn testRunTraceReportsDenial(alloc: std.mem.Allocator) !void {
+    const secret = try std.fmt.allocPrint(alloc, "{s}/.ssh", .{real_home});
+    const r = try runMoat(alloc, real_home, &.{ moat_path, "run", "--trace", "zig", "--", "/bin/ls", secret });
+    try expectContains(r.stderr, "denied by the sandbox");
+    try expectContains(r.stderr, secret);
+    try expectContains(r.stderr, "moat allow");
+}
+
 
 fn testShellStartsClean(alloc: std.mem.Allocator) !void {
     var env = std.process.Environ.Map.init(alloc);

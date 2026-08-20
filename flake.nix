@@ -48,8 +48,13 @@
       };
     };
 
+    # zig-out/bin first, so `moat` is the tree you just built and not a
+    # profile-installed copy.
     devShells.${system}.default = pkgs.mkShell {
       packages = [ zig-master ];
+      shellHook = ''
+        export PATH="$PWD/zig-out/bin:$PATH"
+      '';
     };
   };
 }

@@ -31,13 +31,19 @@ Inspired by [nmattia/dune](https://github.com/nmattia/dune).
 ## Quick start
 
 ```bash
-moat shell zig         # enter a sandboxed zig shell
-moat shell rust go     # combine multiple shells
-moat link . rust go    # associate current dir with shells
-moat detect            # show what shells would activate
-moat check             # validate config (paths, shells, flake)
-moat -v shell rust     # verbose: show build progress
+moat shell zig                    # enter a sandboxed zig shell
+moat shell rust go                # combine multiple shells
+moat shell                        # shells detected for this directory
+moat run zig -- zig build         # run one command sandboxed, then exit
+moat run -- zig build             # same, shells detected
+moat run --trace zig -- zig build # report what the sandbox blocked
+moat link . rust go               # associate current dir with shells
+moat detect                       # show what shells would activate
+moat check                        # validate config (paths, shells, flake)
+moat -v shell rust                # verbose: show build progress
 ```
+
+With no shell names, `shell` and `run` use whatever `moat detect` reports for the current directory, and say which shells they picked.
 
 ## How it works
 
@@ -55,6 +61,7 @@ moat -v shell rust     # verbose: show build progress
 ```zig
 .{
     .jailbreak = .{ "git" },
+    .default = .{ "just", "jq" },
     .links = .{
         .{ .dir = "/Users/you/git/project-a", .shells = .{ "rust" } },
         .{ .dir = "/Users/you/git/project-b", .shells = .{ "rust", "go" } },
@@ -67,6 +74,14 @@ moat -v shell rust     # verbose: show build progress
 }
 ```
 
+### default
+
+`default` names shells added to every session, on top of whatever is named or detected — a place for tools you want everywhere, like `just` or `jq`.
+
+They come last on `PATH`, so a named or detected shell wins when both provide the same binary. Adding a tool to `default` cannot change which one an existing project already resolves to.
+
+`moat detect` lists them separately, since they apply regardless of directory.
+
 ### allow
 
 Grants a binary access to a path outside the root, without giving it a full escape:
@@ -74,8 +89,12 @@ Grants a binary access to a path outside the root, without giving it a full esca
 ```bash
 moat allow git ~/.gitconfig            # read-only
 moat allow cargo ~/.cargo --write      # read/write
+moat allow cargo ~/.rustup --exec      # read + run binaries from there
 moat allow '*' ~/.config/nvim          # every binary
+moat unallow zig ~/.cache/zig          # remove a grant
 ```
+
+Re-granting a path widens the existing rule rather than adding a second one, and `~/x` and `/Users/you/x` are treated as the same path. Rules scoped by `dirs` are left alone by both commands.
 
 Which writes:
 
@@ -88,6 +107,10 @@ Which writes:
 ```
 
 Read-only unless `write = true`. `dirs` restricts a rule to certain project roots, so the same binary can have read access in one project and write access in another; an empty `dirs` applies everywhere. Paths are stored with `~` unexpanded so the config stays portable.
+
+`exec = true` adds `process-exec` and `file-map-executable`. Neither `file-read*` nor `file*` implies them, so a toolchain that runs binaries out of a granted directory — `cargo` launching a `~/.rustup` toolchain, `zig` running a build helper from its cache — needs it. `write` and `exec` are independent.
+
+Under `$MOAT_ROOT` exec is already allowed, so a tool whose cache can move inside the root needs [`MOAT_ENV_HOME`](#moat_env_home) rather than this.
 
 `moat shell` applies one profile to the whole session, so grants are unioned: a rule for `git` is in effect for everything in that shell. Per-binary enforcement would need each wrapped binary to sandbox itself, which no current entry point does.
 
@@ -106,6 +129,42 @@ Names are resolved against `PATH` to an absolute path before being written into 
 Detection rules match when all listed markers exist in the directory. Multiple matching rules stack their shells.
 
 Per-project override: create a `.moat-shell` file (gitignored) with one shell name per line.
+
+## Running one command
+
+`moat run` builds the same profile as `moat shell`, runs a single command inside it, and exits with that command's status:
+
+```bash
+moat run zig -- zig build
+moat run rust go -- cargo test
+```
+
+Shell names come before `--`, the command after it. The command is resolved against the shell's `PATH`, so `zig` is the wrapped binary, not one already on your `PATH`.
+
+## Finding what the sandbox blocked
+
+`--trace` reports the paths the sandbox denied during the run, and prints a `moat allow` line for each:
+
+```
+$ moat run --trace zig -- zig build
+error: unable to open global cache directory "/Users/you/.cache/zig": PermissionDenied
+
+moat: 1 path(s) denied by the sandbox
+  zig            file-read-data         /Users/you/.cache/zig
+
+to grant, pick the ones you actually need:
+  moat allow zig /Users/you/.cache/zig
+```
+
+The suggested grant is read-only, matching the operation that was denied. A tool that also writes there needs `--write`, and a tool whose cache lives under `$HOME` is usually better served by [`MOAT_ENV_HOME`](#moat_env_home) than by a grant.
+
+Attribution is by process id: anything sandboxed that starts after moat is attributed to the run, including unrelated processes running concurrently. Check the process column before acting on a line.
+
+Denials come from the macOS unified log, which the sandbox itself denies access to, so `--trace` runs the command in a child and reads the log from the unconfined parent.
+
+Entries reach the log a moment after the event, so `--trace` waits briefly before reading. A heavily loaded log daemon can still lag; a run that reports nothing is not proof that nothing was denied.
+
+The longer the command runs, the more unrelated processes fall inside the window, which is why `--trace` covers a single command rather than `moat shell`. To investigate a failure inside a shell, re-run the command that failed under `moat run --trace`.
 
 ## Defining shells
 

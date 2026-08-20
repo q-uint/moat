@@ -1,10 +1,83 @@
 const std = @import("std");
 
+fn expandInto(buf: []u8, home: []const u8, p: []const u8) []const u8 {
+    const rest: []const u8 = if (std.mem.eql(u8, p, "~"))
+        ""
+    else if (std.mem.startsWith(u8, p, "~/"))
+        p[1..]
+    else
+        return p;
+    if (home.len + rest.len > buf.len) return p;
+    @memcpy(buf[0..home.len], home);
+    @memcpy(buf[home.len..][0..rest.len], rest);
+    return buf[0 .. home.len + rest.len];
+}
+
+// `~/x` and the shell-expanded `/Users/you/x` name the same rule.
+fn samePath(home: []const u8, a: []const u8, b: []const u8) bool {
+    var ba: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    var bb: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    return std.mem.eql(u8, expandInto(&ba, home, a), expandInto(&bb, home, b));
+}
+
+// True when `a` already grants everything `b` grants for `path`, making b's
+// entry for it redundant.
+pub fn covers(home: []const u8, a: Config.AllowRule, b: Config.AllowRule, path: []const u8) bool {
+    if (!a.matchesBin(b.bin)) return false;
+    if (b.write and !a.write) return false;
+    if (b.exec and !a.exec) return false;
+    if (a.dirs.len != 0) {
+        if (b.dirs.len == 0) return false;
+        for (b.dirs) |d| {
+            if (!a.matchesDir(d)) return false;
+        }
+    }
+    for (a.paths) |p| {
+        if (samePath(home, p, path)) return true;
+    }
+    return false;
+}
+
+test "covers" {
+    const home = "/Users/test";
+    const R = Config.AllowRule;
+    const global = R{ .bin = "zig", .paths = &.{"~/.cache/zig"} };
+    const scoped = R{ .bin = "zig", .paths = &.{"~/.cache/zig"}, .dirs = &.{"/Users/test/work"} };
+
+    // Same flags, wider scope: the scoped rule is dead.
+    try std.testing.expect(covers(home, global, scoped, "~/.cache/zig"));
+    try std.testing.expect(!covers(home, scoped, global, "~/.cache/zig"));
+
+    // The shell-expanded form is the same path.
+    try std.testing.expect(covers(home, global, scoped, "/Users/test/.cache/zig"));
+
+    // A narrower grant cannot cover a wider one.
+    const scoped_w = R{ .bin = "zig", .paths = &.{"~/.cache/zig"}, .write = true, .dirs = &.{"/Users/test/work"} };
+    try std.testing.expect(!covers(home, global, scoped_w, "~/.cache/zig"));
+    const global_w = R{ .bin = "zig", .paths = &.{"~/.cache/zig"}, .write = true };
+    try std.testing.expect(covers(home, global_w, scoped_w, "~/.cache/zig"));
+
+    // exec is independent of write.
+    const scoped_x = R{ .bin = "zig", .paths = &.{"~/.cache/zig"}, .exec = true, .dirs = &.{"/Users/test/work"} };
+    try std.testing.expect(!covers(home, global_w, scoped_x, "~/.cache/zig"));
+
+    // `*` covers a named binary, not the reverse.
+    const star = R{ .bin = "*", .paths = &.{"~/.cache/zig"} };
+    try std.testing.expect(covers(home, star, scoped, "~/.cache/zig"));
+    try std.testing.expect(!covers(home, scoped, star, "~/.cache/zig"));
+
+    // A different path is not covered.
+    try std.testing.expect(!covers(home, global, scoped, "~/.cargo"));
+}
+
 pub const Config = struct {
     jailbreak: []const []const u8 = &.{},
     allow: []const AllowRule = &.{},
     links: []const Link = &.{},
     detect: []const DetectRule = &.{},
+    // Unioned into every session, after the named or detected shells so those
+    // win on PATH.
+    default: []const []const u8 = &.{},
 
     // Enforced per-binary when a wrapped binary sandboxes itself; unioned into
     // the session profile under `moat shell`, where nesting cannot widen.
@@ -12,6 +85,7 @@ pub const Config = struct {
         bin: []const u8,
         paths: []const []const u8,
         write: bool = false,
+        exec: bool = false,
         // Empty means every project; otherwise only these roots (and subdirs).
         dirs: []const []const u8 = &.{},
 
@@ -186,25 +260,74 @@ pub fn removeLink(alloc: std.mem.Allocator, io: std.Io, home: []const u8, dir: [
     try saveConfig(alloc, io, loaded.path, withLinks(loaded.config, links.items));
 }
 
-pub fn addAllow(alloc: std.mem.Allocator, io: std.Io, home: []const u8, bin: []const u8, path: []const u8, write: bool) !void {
+// Allows are additive and there is no deny, so a second grant for a path can
+// only ever widen it. Rules scoped by `dirs` are a different scope and are left
+// alone.
+// Rules scoped by `dirs` are left alone, as in addAllow.
+pub fn removeAllow(alloc: std.mem.Allocator, io: std.Io, home: []const u8, bin: []const u8, path: []const u8) !usize {
     const loaded = try load(alloc, io, home);
     var rules: std.ArrayList(Config.AllowRule) = .empty;
-    var merged = false;
+    var removed: usize = 0;
     for (loaded.config.allow) |r| {
-        if (std.mem.eql(u8, r.bin, bin) and r.write == write) {
-            var paths: std.ArrayList([]const u8) = .empty;
-            try paths.appendSlice(alloc, r.paths);
-            for (r.paths) |p| {
-                if (std.mem.eql(u8, p, path)) return; // already granted
+        const mergeable = r.dirs.len == 0 and std.mem.eql(u8, r.bin, bin);
+        var paths: std.ArrayList([]const u8) = .empty;
+        for (r.paths) |p| {
+            if (mergeable and samePath(home, p, path)) {
+                removed += 1;
+                continue;
             }
-            try paths.append(alloc, path);
-            try rules.append(alloc, .{ .bin = bin, .paths = paths.items, .write = write });
-            merged = true;
-        } else try rules.append(alloc, r);
+            try paths.append(alloc, p);
+        }
+        if (paths.items.len == 0) continue;
+        try rules.append(alloc, .{ .bin = r.bin, .paths = paths.items, .write = r.write, .exec = r.exec, .dirs = r.dirs });
     }
-    if (!merged) try rules.append(alloc, .{ .bin = bin, .paths = &.{path}, .write = write });
+    if (removed == 0) return 0;
 
     var out = loaded.config;
     out.allow = rules.items;
     try saveConfig(alloc, io, loaded.path, out);
+    return removed;
+}
+
+pub const Granted = struct { write: bool, exec: bool, config_path: []const u8 };
+
+pub fn addAllow(alloc: std.mem.Allocator, io: std.Io, home: []const u8, bin: []const u8, path: []const u8, write: bool, exec: bool) !Granted {
+    const loaded = try load(alloc, io, home);
+
+    var want_write = write;
+    var want_exec = exec;
+    for (loaded.config.allow) |r| {
+        if (r.dirs.len != 0 or !std.mem.eql(u8, r.bin, bin)) continue;
+        for (r.paths) |p| {
+            if (!samePath(home, p, path)) continue;
+            want_write = want_write or r.write;
+            want_exec = want_exec or r.exec;
+        }
+    }
+
+    var rules: std.ArrayList(Config.AllowRule) = .empty;
+    var merged = false;
+    for (loaded.config.allow) |r| {
+        const mergeable = r.dirs.len == 0 and std.mem.eql(u8, r.bin, bin);
+        const target = mergeable and r.write == want_write and r.exec == want_exec;
+
+        var paths: std.ArrayList([]const u8) = .empty;
+        for (r.paths) |p| {
+            // Dropped here and re-added to the widened rule below.
+            if (mergeable and samePath(home, p, path)) continue;
+            try paths.append(alloc, p);
+        }
+        if (target) {
+            try paths.append(alloc, path);
+            merged = true;
+        }
+        if (paths.items.len == 0) continue;
+        try rules.append(alloc, .{ .bin = r.bin, .paths = paths.items, .write = r.write, .exec = r.exec, .dirs = r.dirs });
+    }
+    if (!merged) try rules.append(alloc, .{ .bin = bin, .paths = &.{path}, .write = want_write, .exec = want_exec });
+
+    var out = loaded.config;
+    out.allow = rules.items;
+    try saveConfig(alloc, io, loaded.path, out);
+    return .{ .write = want_write, .exec = want_exec, .config_path = loaded.path };
 }
