@@ -8,6 +8,48 @@ fn linkSandbox(mod: *std.Build.Module, b: *std.Build) void {
     mod.linkSystemLibrary("sandbox", .{});
 }
 
+// Only the top of the chain: nix-flake-c's pkg-config Requires pulls in expr,
+// fetchers, store and util. Listing them as well makes each appear twice in the
+// link line, and dyld refuses to load a binary with duplicate dylib entries.
+const nix_lib = "nix-flake-c";
+
+// src/nix_c.zig is generated from nix's headers and committed, so a build needs
+// neither the headers nor translate-c: only the libraries to link against. Run
+// `zig build bindings` after a nix upgrade, and update nix.tested_version.
+fn addBindingsStep(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) void {
+    const step = b.step("bindings", "Regenerate src/nix_c.zig from nix's C headers");
+    var code: u8 = 0;
+    const cflags = b.runAllowFail(
+        &.{ "pkg-config", "--cflags-only-I", "nix-flake-c", "nix-expr-c", "nix-store-c", "nix-util-c", "nix-fetchers-c" },
+        &code,
+        .ignore,
+    ) catch {
+        // Without the headers the step cannot run, but the normal build still can.
+        return;
+    };
+
+    const translate = b.addTranslateC(.{
+        .root_source_file = b.path("src/nix_c.h"),
+        .target = target,
+        .optimize = optimize,
+    });
+    var it = std.mem.tokenizeAny(u8, cflags, " \n\r");
+    while (it.next()) |flag| {
+        if (std.mem.startsWith(u8, flag, "-I")) translate.addIncludePath(.{ .cwd_relative = flag[2..] });
+    }
+
+    const update = b.addUpdateSourceFiles();
+    update.addCopyFileToSource(translate.getOutput(), "src/nix_c.zig");
+    step.dependOn(&update.step);
+}
+
+// Only the CLI evaluates and builds flakes. The wrapper runs inside the sandbox
+// on every command and stays free of the nix C++ closure.
+fn linkNix(mod: *std.Build.Module) void {
+    mod.link_libc = true;
+    mod.linkSystemLibrary(nix_lib, .{ .use_pkg_config = .force });
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -31,6 +73,9 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     linkSandbox(cli_mod, b);
+    linkNix(cli_mod);
+    cli_mod.addAnonymousImport("nix_c", .{ .root_source_file = b.path("src/nix_c.zig") });
+    addBindingsStep(b, target, optimize);
 
     const cli = b.addExecutable(.{
         .name = "moat",
@@ -86,6 +131,18 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const env_unit_mod = b.createModule(.{
+        .root_source_file = b.path("src/env.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const lock_unit_mod = b.createModule(.{
+        .root_source_file = b.path("src/lock.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = wrapper_test_mod })).step);
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = cli_test_mod })).step);
@@ -94,6 +151,8 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = denials_unit_mod })).step);
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = confirm_unit_mod })).step);
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = shell_env_unit_mod })).step);
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = env_unit_mod })).step);
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = lock_unit_mod })).step);
 
     const sandbox_test_mod = b.createModule(.{
         .root_source_file = b.path("src/test_sandbox.zig"),

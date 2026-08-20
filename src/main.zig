@@ -2,7 +2,10 @@ const std = @import("std");
 const config = @import("config.zig");
 const sandbox = @import("sandbox.zig");
 const denials = @import("denials.zig");
+const nix = @import("nix.zig");
 const confirm = @import("confirm.zig");
+const lock = @import("lock.zig");
+const env_mod = @import("env.zig");
 
 const usage_text =
     \\moat - sandboxed dev environments
@@ -16,6 +19,7 @@ const usage_text =
     \\  moat unapprove [dir]         forget them for a project (--all for every one)
     \\  moat link <dir> <name...>    associate a directory with shell(s)
     \\  moat unlink <dir>            remove a directory association
+    \\  moat update [name...]        move pinned shells to the current revision
     \\  moat detect [dir]            show which shells would activate
     \\  moat check                   validate config (paths, shells)
     \\  moat help                    show this message
@@ -51,7 +55,14 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(1);
     };
 
-    const home = init.environ_map.get("HOME") orelse usageError("HOME not set", .{});
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const cmd_alloc = arena.allocator();
+
+    // Read once, up front: every later lookup goes through this. From the arena,
+    // since a command that returns instead of exec'ing would otherwise leak it.
+    const env = try env_mod.from(cmd_alloc, init.environ_map);
+    const home = env.home orelse usageError("HOME not set", .{});
 
     var rest: std.ArrayList([]const u8) = .empty;
     defer rest.deinit(alloc);
@@ -65,12 +76,9 @@ pub fn main(init: std.process.Init) !void {
         try rest.append(alloc, a);
     }
 
-    var arena = std.heap.ArenaAllocator.init(alloc);
-    defer arena.deinit();
-    const cmd_alloc = arena.allocator();
-
-    if (std.mem.eql(u8, command, "shell")) return cmdShell(cmd_alloc, io, init.environ_map, home, rest.items, verbose);
-    if (std.mem.eql(u8, command, "run")) return cmdRun(cmd_alloc, io, init.environ_map, home, rest.items, verbose, trace);
+    if (std.mem.eql(u8, command, "shell")) return cmdShell(cmd_alloc, io, init.environ_map, env, rest.items, verbose);
+    if (std.mem.eql(u8, command, "run")) return cmdRun(cmd_alloc, io, init.environ_map, env, rest.items, verbose, trace);
+    if (std.mem.eql(u8, command, "update")) return cmdUpdate(cmd_alloc, io, home, env.flake, rest.items);
     if (std.mem.eql(u8, command, "allow")) return cmdAllow(cmd_alloc, io, home, rest.items);
     if (std.mem.eql(u8, command, "unallow")) return cmdUnallow(cmd_alloc, io, home, rest.items);
     if (std.mem.eql(u8, command, "approvals")) return cmdApprovals(cmd_alloc, io, home);
@@ -78,7 +86,7 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, command, "link")) return cmdLink(cmd_alloc, io, home, rest.items);
     if (std.mem.eql(u8, command, "unlink")) return cmdUnlink(cmd_alloc, io, home, rest.items);
     if (std.mem.eql(u8, command, "detect")) return cmdDetect(cmd_alloc, io, home, rest.items);
-    if (std.mem.eql(u8, command, "check")) return cmdCheck(cmd_alloc, io, init.environ_map, home);
+    if (std.mem.eql(u8, command, "check")) return cmdCheck(cmd_alloc, io, env);
     if (std.mem.eql(u8, command, "help")) return printUsage(io);
 
     std.debug.print("moat: unknown command '{s}'\n", .{command});
@@ -100,26 +108,103 @@ fn usageError(comptime fmt: []const u8, args: anytype) noreturn {
     std.process.exit(1);
 }
 
-fn flakeRef(environ: *std.process.Environ.Map) []const u8 {
-    return environ.get("MOAT_FLAKE") orelse "github:q-uint/moat";
+// One nix session per moat run, created only when something actually needs
+// evaluating: a lock hit whose store path is present never gets here.
+const NixSession = struct {
+    handle: ?nix.Nix = null,
+
+    fn get(self: *NixSession, alloc: std.mem.Allocator) !*nix.Nix {
+        if (self.handle == null) {
+            const running = nix.runningVersion();
+            if (!nix.versionMatches(nix.tested_version, running)) {
+                std.debug.print("moat: linked against nix {s}, built for {s}; the C API has no ABI promise\n", .{ running, nix.tested_version });
+            }
+            self.handle = nix.Nix.init(alloc) catch |err| {
+                std.debug.print("moat: cannot initialise nix: {s}\n", .{@errorName(err)});
+                return err;
+            };
+        }
+        return &self.handle.?;
+    }
+
+    fn deinit(self: *NixSession) void {
+        if (self.handle) |*h| h.deinit();
+    }
+};
+
+fn nixBuild(session: *NixSession, alloc: std.mem.Allocator, flake_ref: []const u8, attr: []const u8) ![]const u8 {
+    const n = try session.get(alloc);
+    return n.build(flake_ref, attr, nix.system) catch |err| {
+        std.debug.print("moat: cannot build {s}#{s}: {s}\n", .{ flake_ref, attr, n.lastError() });
+        return err;
+    };
 }
 
-fn buildShells(alloc: std.mem.Allocator, io: std.Io, environ: *std.process.Environ.Map, shells: []const []const u8, verbose: bool) ![]const []const u8 {
-    var paths: std.ArrayList([]const u8) = .empty;
-    const flake = flakeRef(environ);
-    for (shells) |name| {
-        if (verbose) std.debug.print("moat: building {s}...\n", .{name});
-        const attr = try std.fmt.allocPrint(alloc, "{s}#{s}", .{ flake, name });
-        const result = try std.process.run(alloc, io, .{
-            .argv = &.{ "nix", "build", attr, "--no-link", "--print-out-paths" },
-        });
-        if (!result.term.success()) {
-            std.debug.print("moat: nix build failed for '{s}'\n{s}", .{ name, result.stderr });
-            return error.NixBuildFailed;
+// Empty when the ref cannot be pinned or nix cannot resolve a revision for it.
+fn resolveRev(session: *NixSession, alloc: std.mem.Allocator, flake: []const u8) []const u8 {
+    if (!lock.pinnable(flake)) return "";
+    const n = session.get(alloc) catch return "";
+    return n.rev(flake) orelse "";
+}
+
+// A shell name is either an attribute of MOAT_FLAKE or a qualified ref carrying
+// its own flake, so a shell someone shares needs no config to try.
+fn shellAttr(alloc: std.mem.Allocator, flake: []const u8, name: []const u8) ![]const u8 {
+    const parts = lock.split(name);
+    return std.fmt.allocPrint(alloc, "{s}#{s}", .{ parts.flake orelse flake, parts.attr });
+}
+
+// Builds from the locked ref when there is one, so a moving branch is followed
+// only by `moat update`. A recorded store path that still exists skips nix
+// entirely, which is also the fast path.
+fn buildShell(session: *NixSession, alloc: std.mem.Allocator, io: std.Io, flake: []const u8, current: lock.Lock, name: []const u8, verbose: bool) !struct { out: []const u8, entry: ?lock.Lock.Entry } {
+    const parts = lock.split(name);
+    const base = parts.flake orelse flake;
+
+    if (current.lookup(name)) |e| {
+        if (e.out.len > 0) {
+            if (std.Io.Dir.cwd().access(io, e.out, .{})) |_| {
+                if (verbose) std.debug.print("moat: {s} pinned{s}{s}\n", .{ name, if (e.rev.len > 0) " at " else " (unpinned source)", e.rev });
+                return .{ .out = e.out, .entry = null };
+            } else |_| {}
         }
-        const path = std.mem.trim(u8, result.stdout, &std.ascii.whitespace);
-        try paths.append(alloc, path);
+        // Gone from the store: rebuild from the same ref, not from the branch.
+        if (verbose) std.debug.print("moat: rebuilding {s}...\n", .{name});
+        const ref = if (e.ref.len > 0) e.ref else base;
+        const out = try nixBuild(session, alloc, ref, parts.attr);
+        return .{ .out = out, .entry = .{ .name = name, .ref = e.ref, .rev = e.rev, .out = out } };
     }
+
+    // First use: resolve the mutable ref once, and record what it resolved to.
+    if (verbose) std.debug.print("moat: building {s}...\n", .{name});
+    const rev = resolveRev(session, alloc, base);
+    const pinned = try lock.withRev(alloc, base, rev);
+    const out = try nixBuild(session, alloc, pinned, parts.attr);
+    if (rev.len > 0) {
+        std.debug.print("moat: pinned {s} to {s}\n", .{ name, rev[0..@min(rev.len, 12)] });
+    } else {
+        std.debug.print("moat: {s} cannot be pinned ({s}); `moat update` will not help\n", .{ name, base });
+    }
+    return .{ .out = out, .entry = .{ .name = name, .ref = pinned, .rev = rev, .out = out } };
+}
+
+fn buildShells(alloc: std.mem.Allocator, io: std.Io, home: []const u8, flake: []const u8, shells: []const []const u8, verbose: bool) ![]const []const u8 {
+    var paths: std.ArrayList([]const u8) = .empty;
+    var current = try lock.load(alloc, io, home);
+    var session: NixSession = .{};
+    defer session.deinit();
+    var dirty = false;
+    for (shells) |name| {
+        const built = try buildShell(&session, alloc, io, flake, current, name, verbose);
+        try paths.append(alloc, built.out);
+        if (built.entry) |e| {
+            current = try lock.upsert(alloc, current, e);
+            dirty = true;
+        }
+    }
+    if (dirty) lock.save(alloc, io, home, current) catch |err| {
+        std.debug.print("moat: cannot write lock: {s}\n", .{@errorName(err)});
+    };
     return paths.items;
 }
 
@@ -237,7 +322,8 @@ fn confirmNeeded(list: []const []const u8, label: []const u8, shells: []const []
 }
 
 // Builds the shells, installs the profile, and leaves the caller to exec.
-fn prepareSession(alloc: std.mem.Allocator, io: std.Io, environ: *std.process.Environ.Map, home: []const u8, shells: []const []const u8, verbose: bool, label: []const u8) ![]const u8 {
+fn prepareSession(alloc: std.mem.Allocator, io: std.Io, environ: *std.process.Environ.Map, env: env_mod.Env, shells: []const []const u8, verbose: bool, label: []const u8) ![]const u8 {
+    const home = env.home.?;
     var cwd_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const n = try std.process.currentPath(io, &cwd_buf);
     const cwd = try alloc.dupe(u8, cwd_buf[0..n]);
@@ -251,7 +337,7 @@ fn prepareSession(alloc: std.mem.Allocator, io: std.Io, environ: *std.process.En
 
     const loaded = try config.load(alloc, io, home);
     // buildShells already reported; a stack trace on top is noise.
-    const store_paths = buildShells(alloc, io, environ, args, verbose) catch std.process.exit(1);
+    const store_paths = buildShells(alloc, io, home, env.flake, args, verbose) catch std.process.exit(1);
 
     var path_buf: std.ArrayList(u8) = .empty;
     for (store_paths) |p| {
@@ -259,9 +345,9 @@ fn prepareSession(alloc: std.mem.Allocator, io: std.Io, environ: *std.process.En
         try path_buf.appendSlice(alloc, p);
         try path_buf.appendSlice(alloc, "/bin");
     }
-    if (environ.get("PATH")) |existing| {
+    if (env.path.len > 0) {
         try path_buf.append(alloc, ':');
-        try path_buf.appendSlice(alloc, existing);
+        try path_buf.appendSlice(alloc, env.path);
     }
 
     try environ.put("PATH", path_buf.items);
@@ -293,12 +379,12 @@ fn prepareSession(alloc: std.mem.Allocator, io: std.Io, environ: *std.process.En
 
     // The wrapped binaries in this session skip their own check, since the
     // session profile is already applied by the time they run.
-    const mode = confirm.modeFromEnv(environ.get("MOAT_CONFIRM"));
+    const mode = confirm.modeFromEnv(env.confirm);
     if (confirmNeeded(loaded.config.confirm, label, args, mode)) {
         confirm.ensure(alloc, io, .{
             .bin = label,
             .root = profile.root,
-            .env_home = environ.get("MOAT_ENV_HOME"),
+            .env_home = env.env_home,
             .grants = grants,
             .jailbreaks = jailbreaks.items,
         }, home, mode) catch {
@@ -320,17 +406,16 @@ fn prepareSession(alloc: std.mem.Allocator, io: std.Io, environ: *std.process.En
     return profile.root;
 }
 
-fn cmdShell(alloc: std.mem.Allocator, io: std.Io, environ: *std.process.Environ.Map, home: []const u8, args: []const []const u8, verbose: bool) !void {
-    const shells = try resolveShells(alloc, io, home, args);
-    _ = try prepareSession(alloc, io, environ, home, shells, verbose, "shell");
-    const user_shell = environ.get("SHELL") orelse "/bin/bash";
+fn cmdShell(alloc: std.mem.Allocator, io: std.Io, environ: *std.process.Environ.Map, env: env_mod.Env, args: []const []const u8, verbose: bool) !void {
+    const shells = try resolveShells(alloc, io, env.home.?, args);
+    _ = try prepareSession(alloc, io, environ, env, shells, verbose, "shell");
     return std.process.replace(io, .{
-        .argv = &.{user_shell},
+        .argv = &.{env.shell},
         .environ_map = environ,
     });
 }
 
-fn cmdRun(alloc: std.mem.Allocator, io: std.Io, environ: *std.process.Environ.Map, home: []const u8, args: []const []const u8, verbose: bool, trace: bool) !void {
+fn cmdRun(alloc: std.mem.Allocator, io: std.Io, environ: *std.process.Environ.Map, env: env_mod.Env, args: []const []const u8, verbose: bool, trace: bool) !void {
     const sep = indexOfArg(args, "--") orelse
         usageError("usage: moat run [name...] -- <cmd> [args...]", .{});
     const named = args[0..sep];
@@ -338,7 +423,7 @@ fn cmdRun(alloc: std.mem.Allocator, io: std.Io, environ: *std.process.Environ.Ma
     if (command.len == 0) {
         usageError("usage: moat run [name...] -- <cmd> [args...]", .{});
     }
-    const shells = try resolveShells(alloc, io, home, named);
+    const shells = try resolveShells(alloc, io, env.home.?, named);
     if (trace) {
         var tail: std.ArrayList([]const u8) = .empty;
         try tail.append(alloc, "run");
@@ -346,10 +431,11 @@ fn cmdRun(alloc: std.mem.Allocator, io: std.Io, environ: *std.process.Environ.Ma
         return traceChild(alloc, io, environ, tail.items);
     }
 
-    _ = try prepareSession(alloc, io, environ, home, shells, verbose, std.fs.path.basename(command[0]));
+    _ = try prepareSession(alloc, io, environ, env, shells, verbose, std.fs.path.basename(command[0]));
 
     // replace() resolves argv[0] against the pre-existing PATH, which would run
-    // the unwrapped host binary instead of the shell's.
+    // the unwrapped host binary instead of the shell's. prepareSession put the
+    // shell's PATH on the map, so read it from there rather than from `env`.
     const path_env = environ.get("PATH") orelse "";
     const exe = (try sandbox.findInPath(alloc, io, path_env, command[0])) orelse {
         std.debug.print("moat: '{s}' not found in the shell's PATH\n", .{command[0]});
@@ -412,6 +498,47 @@ fn cmdUnallow(alloc: std.mem.Allocator, io: std.Io, home: []const u8, args: []co
         std.process.exit(1);
     }
     std.debug.print("removed {s}: {s}\n", .{ args[0], args[1] });
+}
+
+// The only thing that moves a pin, so a moving branch is followed when you say
+// so rather than on every launch.
+fn cmdUpdate(alloc: std.mem.Allocator, io: std.Io, home: []const u8, flake: []const u8, args: []const []const u8) !void {
+    var current = try lock.load(alloc, io, home);
+    if (current.shells.len == 0) {
+        std.debug.print("no shells pinned yet; they pin themselves on first use\n", .{});
+        return;
+    }
+
+    var session: NixSession = .{};
+    defer session.deinit();
+
+    var changed: usize = 0;
+    for (current.shells) |e| {
+        if (args.len > 0 and indexOfArg(args, e.name) == null) continue;
+        const parts = lock.split(e.name);
+        const base = parts.flake orelse flake;
+        if (!lock.pinnable(base)) {
+            std.debug.print("  {s: <20} unpinned source ({s}), tracks the working tree\n", .{ e.name, base });
+            continue;
+        }
+        const rev = resolveRev(&session, alloc, base);
+        const pinned = try lock.withRev(alloc, base, rev);
+        const out = nixBuild(&session, alloc, pinned, parts.attr) catch continue;
+
+        if (std.mem.eql(u8, out, e.out)) {
+            std.debug.print("  {s: <20} unchanged\n", .{e.name});
+        } else {
+            std.debug.print("  {s: <20} {s} -> {s}\n", .{
+                e.name,
+                if (e.rev.len > 0) e.rev[0..@min(e.rev.len, 12)] else "unpinned",
+                if (rev.len > 0) rev[0..@min(rev.len, 12)] else "unpinned",
+            });
+            changed += 1;
+        }
+        current = try lock.upsert(alloc, current, .{ .name = e.name, .ref = pinned, .rev = rev, .out = out });
+    }
+    try lock.save(alloc, io, home, current);
+    if (changed == 0) std.debug.print("nothing moved\n", .{});
 }
 
 fn cmdApprovals(alloc: std.mem.Allocator, io: std.Io, home: []const u8) !void {
@@ -510,7 +637,8 @@ fn cmdDetect(alloc: std.mem.Allocator, io: std.Io, home: []const u8, args: []con
     }
 }
 
-fn cmdCheck(alloc: std.mem.Allocator, io: std.Io, environ: *std.process.Environ.Map, home: []const u8) !void {
+fn cmdCheck(alloc: std.mem.Allocator, io: std.Io, env: env_mod.Env) !void {
+    const home = env.home.?;
     const loaded = try config.load(alloc, io, home);
     std.debug.print("config: {s}\n", .{loaded.path});
 
@@ -543,26 +671,21 @@ fn cmdCheck(alloc: std.mem.Allocator, io: std.Io, environ: *std.process.Environ.
     for (loaded.config.links) |link| try config.appendUnique(alloc, &shell_set, link.shells);
     for (loaded.config.detect) |rule| try config.appendUnique(alloc, &shell_set, rule.shells);
 
-    // Check that nix is available and flake ref resolves. A missing nix skips
-    // the flake and shell checks but must still reach the summary below.
-    const flake = flakeRef(environ);
-    if (std.process.run(alloc, io, .{
-        .argv = &.{ "nix", "flake", "metadata", flake, "--json" },
-    })) |flake_result| {
-        if (flake_result.term.success()) {
+    // Resolving the flake and every referenced shell, in process. A shell is
+    // "ok" when its attribute evaluates: building it is what a session does.
+    const flake = env.flake;
+    var session: NixSession = .{};
+    defer session.deinit();
+    if (session.get(alloc)) |n| {
+        if (n.evaluates(flake, null, nix.system)) {
             std.debug.print("  flake: {s} -- ok\n", .{flake});
         } else {
-            std.debug.print("  flake: {s} -- not found\n", .{flake});
+            std.debug.print("  flake: {s} -- {s}\n", .{ flake, n.lastError() });
             issues += 1;
         }
-
-        // Check each shell can be built.
         for (shell_set.items) |name| {
-            const attr = try std.fmt.allocPrint(alloc, "{s}#{s}", .{ flake, name });
-            const result = std.process.run(alloc, io, .{
-                .argv = &.{ "nix", "build", attr, "--no-link", "--dry-run" },
-            }) catch continue;
-            if (result.term.success()) {
+            const parts = lock.split(name);
+            if (n.evaluates(parts.flake orelse flake, parts.attr, nix.system)) {
                 std.debug.print("  shell: {s} -- ok\n", .{name});
             } else {
                 std.debug.print("  shell: {s} -- not found in flake\n", .{name});
@@ -570,7 +693,7 @@ fn cmdCheck(alloc: std.mem.Allocator, io: std.Io, environ: *std.process.Environ.
             }
         }
     } else |_| {
-        std.debug.print("  nix: not found in PATH\n", .{});
+        std.debug.print("  nix: cannot initialise the nix C API\n", .{});
         issues += 1;
     }
 
@@ -587,6 +710,18 @@ fn cmdCheck(alloc: std.mem.Allocator, io: std.Io, environ: *std.process.Environ.
             std.debug.print("  allow: {s} dir {s} -- {s}\n", .{ r.bin, d, @errorName(err) });
             issues += 1;
         };
+    }
+
+    // A pin whose store path is gone still rebuilds from the same ref, so this
+    // is information rather than an issue.
+    const pins = lock.load(alloc, io, home) catch lock.Lock{};
+    for (pins.shells) |e| {
+        const short = if (e.rev.len > 0) e.rev[0..@min(e.rev.len, 12)] else "unpinned";
+        const present = if (e.out.len > 0) blk: {
+            std.Io.Dir.cwd().access(io, e.out, .{}) catch break :blk false;
+            break :blk true;
+        } else false;
+        std.debug.print("  pin: {s} at {s}{s}\n", .{ e.name, short, if (present) "" else " (not in store, will rebuild)" });
     }
 
     // Additive allows mean a wider rule makes a narrower one dead weight.
