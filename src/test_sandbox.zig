@@ -369,7 +369,6 @@ fn testRunTraceReportsDenial(alloc: std.mem.Allocator) !void {
     try expectContains(r.stderr, "moat allow");
 }
 
-
 fn testShellStartsClean(alloc: std.mem.Allocator) !void {
     var env = std.process.Environ.Map.init(alloc);
     try env.put("HOME", real_home);

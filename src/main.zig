@@ -2,6 +2,7 @@ const std = @import("std");
 const config = @import("config.zig");
 const sandbox = @import("sandbox.zig");
 const denials = @import("denials.zig");
+const confirm = @import("confirm.zig");
 
 const usage_text =
     \\moat - sandboxed dev environments
@@ -11,6 +12,8 @@ const usage_text =
     \\  moat run [name...] -- <cmd>  run one command sandboxed, then exit
     \\  moat allow <bin> <path>      grant a binary access to a path (--write, --exec)
     \\  moat unallow <bin> <path>    remove a grant
+    \\  moat approvals               list remembered confirm answers
+    \\  moat unapprove [dir]         forget them for a project (--all for every one)
     \\  moat link <dir> <name...>    associate a directory with shell(s)
     \\  moat unlink <dir>            remove a directory association
     \\  moat detect [dir]            show which shells would activate
@@ -24,6 +27,7 @@ const usage_text =
     \\environment:
     \\  MOAT_FLAKE    flake reference for shells (default: github:q-uint/moat)
     \\  MOAT_ROOT     sandbox boundary (set automatically by shell)
+    \\  MOAT_CONFIRM  never | always (default: ask for binaries listed in `confirm`)
     \\
 ;
 
@@ -69,6 +73,8 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, command, "run")) return cmdRun(cmd_alloc, io, init.environ_map, home, rest.items, verbose, trace);
     if (std.mem.eql(u8, command, "allow")) return cmdAllow(cmd_alloc, io, home, rest.items);
     if (std.mem.eql(u8, command, "unallow")) return cmdUnallow(cmd_alloc, io, home, rest.items);
+    if (std.mem.eql(u8, command, "approvals")) return cmdApprovals(cmd_alloc, io, home);
+    if (std.mem.eql(u8, command, "unapprove")) return cmdUnapprove(cmd_alloc, io, home, rest.items);
     if (std.mem.eql(u8, command, "link")) return cmdLink(cmd_alloc, io, home, rest.items);
     if (std.mem.eql(u8, command, "unlink")) return cmdUnlink(cmd_alloc, io, home, rest.items);
     if (std.mem.eql(u8, command, "detect")) return cmdDetect(cmd_alloc, io, home, rest.items);
@@ -158,7 +164,6 @@ fn resolveShells(alloc: std.mem.Allocator, io: std.Io, home: []const u8, args: [
         std.debug.print("moat: using", .{});
         for (found.shells) |s| std.debug.print(" {s}", .{s});
         std.debug.print(" (via {s})\n", .{switch (found.source) {
-            .override => ".moat-shell",
             .link => "link",
             .detect => "detect rule",
         }});
@@ -220,8 +225,19 @@ fn settledCollect(alloc: std.mem.Allocator, io: std.Io, started: i64, min_pid: u
     return denials.collect(alloc, io, window, min_pid);
 }
 
+// A session profile is one grant set for many binaries, so a confirm entry for
+// the command being run or for any shell in it applies.
+fn confirmNeeded(list: []const []const u8, label: []const u8, shells: []const []const u8, mode: confirm.Mode) bool {
+    if (confirm.required(list, label, mode)) return true;
+    if (mode != .config) return false;
+    for (shells) |s| {
+        if (confirm.required(list, s, .config)) return true;
+    }
+    return false;
+}
+
 // Builds the shells, installs the profile, and leaves the caller to exec.
-fn prepareSession(alloc: std.mem.Allocator, io: std.Io, environ: *std.process.Environ.Map, home: []const u8, shells: []const []const u8, verbose: bool) ![]const u8 {
+fn prepareSession(alloc: std.mem.Allocator, io: std.Io, environ: *std.process.Environ.Map, home: []const u8, shells: []const []const u8, verbose: bool, label: []const u8) ![]const u8 {
     var cwd_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const n = try std.process.currentPath(io, &cwd_buf);
     const cwd = try alloc.dupe(u8, cwd_buf[0..n]);
@@ -275,6 +291,22 @@ fn prepareSession(alloc: std.mem.Allocator, io: std.Io, environ: *std.process.En
     // One profile covers the whole session, so per-binary grants are unioned.
     const grants = try sandbox.collectGrants(alloc, io, loaded.config.allow, "*", profile.root, home);
 
+    // The wrapped binaries in this session skip their own check, since the
+    // session profile is already applied by the time they run.
+    const mode = confirm.modeFromEnv(environ.get("MOAT_CONFIRM"));
+    if (confirmNeeded(loaded.config.confirm, label, args, mode)) {
+        confirm.ensure(alloc, io, .{
+            .bin = label,
+            .root = profile.root,
+            .env_home = environ.get("MOAT_ENV_HOME"),
+            .grants = grants,
+            .jailbreaks = jailbreaks.items,
+        }, home, mode) catch {
+            std.debug.print("moat: not starting {s}\n", .{label});
+            std.process.exit(1);
+        };
+    }
+
     // Apply sandbox to the shell session so all child processes are confined.
     sandbox.apply(.{
         .root = profile.root,
@@ -288,10 +320,9 @@ fn prepareSession(alloc: std.mem.Allocator, io: std.Io, environ: *std.process.En
     return profile.root;
 }
 
-
 fn cmdShell(alloc: std.mem.Allocator, io: std.Io, environ: *std.process.Environ.Map, home: []const u8, args: []const []const u8, verbose: bool) !void {
     const shells = try resolveShells(alloc, io, home, args);
-    _ = try prepareSession(alloc, io, environ, home, shells, verbose);
+    _ = try prepareSession(alloc, io, environ, home, shells, verbose, "shell");
     const user_shell = environ.get("SHELL") orelse "/bin/bash";
     return std.process.replace(io, .{
         .argv = &.{user_shell},
@@ -315,7 +346,7 @@ fn cmdRun(alloc: std.mem.Allocator, io: std.Io, environ: *std.process.Environ.Ma
         return traceChild(alloc, io, environ, tail.items);
     }
 
-    _ = try prepareSession(alloc, io, environ, home, shells, verbose);
+    _ = try prepareSession(alloc, io, environ, home, shells, verbose, std.fs.path.basename(command[0]));
 
     // replace() resolves argv[0] against the pre-existing PATH, which would run
     // the unwrapped host binary instead of the shell's.
@@ -332,7 +363,6 @@ fn cmdRun(alloc: std.mem.Allocator, io: std.Io, environ: *std.process.Environ.Ma
         .environ_map = environ,
     });
 }
-
 
 fn cmdAllow(alloc: std.mem.Allocator, io: std.Io, home: []const u8, args: []const []const u8) !void {
     if (args.len < 2) {
@@ -384,6 +414,39 @@ fn cmdUnallow(alloc: std.mem.Allocator, io: std.Io, home: []const u8, args: []co
     std.debug.print("removed {s}: {s}\n", .{ args[0], args[1] });
 }
 
+fn cmdApprovals(alloc: std.mem.Allocator, io: std.Io, home: []const u8) !void {
+    const path = try confirm.approvalsPath(alloc, home);
+    const entries = try confirm.parseEntries(alloc, try confirm.readApprovals(alloc, io, path));
+    if (entries.len == 0) {
+        std.debug.print("no approvals recorded\n", .{});
+        return;
+    }
+    for (entries) |e| std.debug.print("  {s: <14} {s}\n", .{ e.bin, e.root });
+    std.debug.print("{s}\n", .{path});
+}
+
+fn cmdUnapprove(alloc: std.mem.Allocator, io: std.Io, home: []const u8, args: []const []const u8) !void {
+    const all = args.len > 0 and std.mem.eql(u8, args[0], "--all");
+    const target: ?[]const u8 = if (all)
+        null
+    else if (args.len > 0)
+        try resolvePathArg(alloc, io, args[0])
+    else blk: {
+        var cwd_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const n = try std.process.currentPath(io, &cwd_buf);
+        break :blk try alloc.dupe(u8, cwd_buf[0..n]);
+    };
+
+    const path = try confirm.approvalsPath(alloc, home);
+    const filtered = try confirm.withoutRoot(alloc, try confirm.readApprovals(alloc, io, path), target);
+    if (filtered.removed == 0) {
+        std.debug.print("moat: no approvals for {s}\n", .{target orelse "any project"});
+        std.process.exit(1);
+    }
+    try confirm.writeApprovals(io, path, filtered.content);
+    std.debug.print("dropped {d} approval(s) for {s}\n", .{ filtered.removed, target orelse "every project" });
+}
+
 fn cmdLink(alloc: std.mem.Allocator, io: std.Io, home: []const u8, args: []const []const u8) !void {
     if (args.len < 2) {
         usageError("usage: moat link <dir> <name...>", .{});
@@ -428,7 +491,6 @@ fn cmdDetect(alloc: std.mem.Allocator, io: std.Io, home: []const u8, args: []con
     const result = try config.resolve(alloc, io, &loaded, dir);
     if (result) |r| {
         const source_label: []const u8 = switch (r.source) {
-            .override => ".moat-shell",
             .link => "link",
             .detect => "detect rule",
         };
@@ -437,7 +499,7 @@ fn cmdDetect(alloc: std.mem.Allocator, io: std.Io, home: []const u8, args: []con
         std.debug.print("\n", .{});
     } else if (loaded.config.default.len == 0) {
         std.debug.print("no shells detected for {s}\n", .{dir});
-        std.debug.print("hint: use 'moat link {s} <shell>' or create a .moat-shell file\n", .{dir});
+        std.debug.print("hint: use 'moat link {s} <shell>' or add a detect rule\n", .{dir});
     } else {
         std.debug.print("no shells detected for {s}\n", .{dir});
     }

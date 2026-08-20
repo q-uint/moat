@@ -1,5 +1,7 @@
 # Moat
 
+> **Experimental.** This is a place to try ideas about confining dev tools, not a stable tool. Commands, config keys, the profile itself, and the on disk layout all change without warning or migration, and anything documented here may be gone next week. Pin a commit if you depend on it.
+
 Sandboxed dev environments for macOS (aarch64).
 
 Every dev tool runs inside a macOS sandbox that denies filesystem access by default. Your project root is writable; your home directory, other projects, `/Library`, `/Volumes`, `/tmp`, and other users' files are not readable at all.
@@ -39,6 +41,8 @@ moat run -- zig build             # same, shells detected
 moat run --trace zig -- zig build # report what the sandbox blocked
 moat link . rust go               # associate current dir with shells
 moat detect                       # show what shells would activate
+moat approvals                    # list remembered confirm answers
+moat unapprove                    # forget them for this project
 moat check                        # validate config (paths, shells, flake)
 moat -v shell rust                # verbose: show build progress
 ```
@@ -62,6 +66,7 @@ With no shell names, `shell` and `run` use whatever `moat detect` reports for th
 .{
     .jailbreak = .{ "git" },
     .default = .{ "just", "jq" },
+    .confirm = .{ "npm" },
     .links = .{
         .{ .dir = "/Users/you/git/project-a", .shells = .{ "rust" } },
         .{ .dir = "/Users/you/git/project-b", .shells = .{ "rust", "go" } },
@@ -81,6 +86,30 @@ With no shell names, `shell` and `run` use whatever `moat detect` reports for th
 They come last on `PATH`, so a named or detected shell wins when both provide the same binary. Adding a tool to `default` cannot change which one an existing project already resolves to.
 
 `moat detect` lists them separately, since they apply regardless of directory.
+
+### confirm
+
+`confirm` names binaries that print what they are about to get and ask before starting. `"*"` covers every one:
+
+```
+$ npm install
+moat: about to run npm in /Users/you/git/project-a
+  read/write/exec  /Users/you/git/project-a
+  HOME             /Users/you/git/project-a/.moat/home
+  read             /Users/you/.npmrc
+  jailbreak        /nix/store/xxx/bin/npm  UNSANDBOXED
+  network          allowed
+nothing else outside those paths is readable
+continue? [y/N]
+```
+
+The answer comes from `/dev/tty` rather than stdin, so a tool reading piped input is unaffected. With no terminal to ask on, the binary does not start.
+
+An answer is remembered per project root and access set, in `~/.local/state/moat/approvals`. Adding a grant, adding a jailbreak or pointing `MOAT_ENV_HOME` somewhere else all change the set, so the next run asks again: the prompt appears when access widens, not on every launch. `moat approvals` lists what is remembered and `moat unapprove [dir]` drops it, with `--all` for every project.
+
+`MOAT_CONFIRM=never` skips the prompt, for scripts and CI. `MOAT_CONFIRM=always` forces it even for an approved set, which is how to review what a project currently has; that run is treated as a review and does not change what is stored.
+
+The summary covers what the profile grants, not what the tool does with it. An approval is a statement about paths, not about the code in the repo.
 
 ### allow
 
@@ -128,7 +157,7 @@ Names are resolved against `PATH` to an absolute path before being written into 
 
 Detection rules match when all listed markers exist in the directory. Multiple matching rules stack their shells.
 
-Per-project override: create a `.moat-shell` file (gitignored) with one shell name per line.
+A `links` entry wins over detection, so a project whose markers resolve wrong is fixed with `moat link . <shells>` rather than with a file in the repo.
 
 ## Running one command
 
@@ -190,6 +219,18 @@ Moat ships a `zig` shell. To define your own, create a nix flake (see `examples/
 
 Point `MOAT_FLAKE` at your flake and `moat shell rust` just works.
 
+### Without nix
+
+`sandbox.wrap` is convenience, not a requirement. A shell is a directory holding `bin/<name>` symlinks to `moat-wrapper` plus a `share/moat/manifest` mapping each name to the real binary, and the wrapper finds that manifest relative to the symlink it was invoked through. `examples/wrap-without-nix.sh` builds that layout from binaries already on your machine, which is the quickest way to try moat on a Homebrew or system tool:
+
+```bash
+./examples/wrap-without-nix.sh ~/.local/share/moat-shells/node $(which node) $(which npm)
+export PATH="$HOME/.local/share/moat-shells/node/bin:$PATH"
+cd ~/git/some-project && MOAT_ROOT="$PWD" npm install
+```
+
+Nothing sets `MOAT_ROOT` on this path, so it is yours to set; a wrapped binary refuses to start without it. `moat shell` and `moat run` are the ways to have it set for you, and both need nix.
+
 ## Environment
 
 | Variable | Meaning |
@@ -198,6 +239,7 @@ Point `MOAT_FLAKE` at your flake and `moat shell rust` just works.
 | `MOAT_ROOT` | sandbox boundary; set by `moat shell` |
 | `MOAT_JAILBREAK` | colon-separated binaries that skip the sandbox |
 | `MOAT_ENV_<NAME>` | sets `<NAME>=value` inside the sandbox, then removes the prefixed variable (`HOME` is [special-cased](#moat_env_home)) |
+| `MOAT_CONFIRM` | `never` skips the [confirm prompt](#confirm), `always` forces it; unset means ask for binaries listed in `confirm` |
 | `TMPDIR` | pointed at `$MOAT_ROOT/.moat/tmp`, since `/tmp` is denied |
 
 `MOAT_ENV_*` is applied by the wrapper before the sandbox is installed, so it can pass values to a wrapped binary without leaking the prefixed name into its environment. For example `MOAT_ENV_FOO=bar` runs the binary with `FOO=bar`.

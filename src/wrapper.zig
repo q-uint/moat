@@ -1,6 +1,7 @@
 const std = @import("std");
 const config = @import("config.zig");
 const sandbox = @import("sandbox.zig");
+const confirm = @import("confirm.zig");
 
 pub fn main(init: std.process.Init) !void {
     const alloc = init.gpa;
@@ -100,6 +101,22 @@ pub fn main(init: std.process.Init) !void {
                 , .{ h, root, exe_name, h });
                 std.process.exit(1);
             }
+        }
+
+        // Before apply: the summary names paths this process is about to lose
+        // access to, and the approvals file lives under $HOME.
+        const mode = confirm.modeFromEnv(init.environ_map.get("MOAT_CONFIRM"));
+        if (confirm.required(loaded.config.confirm, exe_name, mode)) {
+            confirm.ensure(alloc, io, .{
+                .bin = exe_name,
+                .root = root,
+                .env_home = env_home,
+                .grants = grants,
+                .jailbreaks = abs_jailbreaks.items,
+            }, home, mode) catch {
+                std.debug.print("moat-wrapper: not starting {s}\n", .{exe_name});
+                std.process.exit(1);
+            };
         }
 
         sandbox.apply(.{

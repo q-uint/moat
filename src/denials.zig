@@ -22,7 +22,7 @@ pub fn parseMessage(msg: []const u8) ?Denial {
 
     const deny = " deny(";
     if (!std.mem.startsWith(u8, rest, deny)) return null;
-    rest = rest[deny.len ..];
+    rest = rest[deny.len..];
     const deny_close = std.mem.indexOfScalar(u8, rest, ')') orelse return null;
     rest = rest[deny_close + 1 ..];
     if (!std.mem.startsWith(u8, rest, " ")) return null;

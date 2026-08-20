@@ -26,7 +26,6 @@ pub fn main(init: std.process.Init) !void {
         .{ "link and detect", testLinkAndDetect },
         .{ "unlink", testUnlink },
         .{ "link relative path", testLinkRelative },
-        .{ "detect .moat-shell override", testDetectOverride },
         .{ "detect rules (build.zig.zon)", testDetectRules },
         .{ "check", testCheck },
         .{ "check rejects bad allow", testCheckRejectsBadAllow },
@@ -288,20 +287,6 @@ fn testLinkRelative(alloc: std.mem.Allocator) !void {
     const result = try run(alloc, home.path, &.{ moat_path, "link", ".", "zig" });
     if (!result.term.success()) return error.NonZeroExit;
     try expectContains(result.stderr, "linked");
-}
-
-fn testDetectOverride(alloc: std.mem.Allocator) !void {
-    const home = try TestHome.init(alloc);
-    defer home.deinit();
-    const dir = try std.fmt.allocPrint(alloc, "{s}/override-proj", .{home.path});
-    std.Io.Dir.cwd().createDirPath(io, dir) catch {};
-
-    const shell_file = try std.fmt.allocPrint(alloc, "{s}/.moat-shell", .{dir});
-    try writeFile(shell_file, "node\n");
-
-    const result = try run(alloc, home.path, &.{ moat_path, "detect", dir });
-    try expectContains(result.stderr, ".moat-shell");
-    try expectContains(result.stderr, "node");
 }
 
 fn testDetectRules(alloc: std.mem.Allocator) !void {

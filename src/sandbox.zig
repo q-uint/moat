@@ -65,8 +65,9 @@ fn containsPath(parent: []const u8, child: []const u8) bool {
 pub const tmp_subdir = ".moat/tmp";
 
 // Creates <root>/.moat/tmp and points TMPDIR at it. The .moat dir carries a
-// .gitignore of "*", which ignores its contents and itself, so the user's own
-// .gitignore is left alone.
+// .gitignore of "*", which ignores its contents and itself, so moat's files can
+// sit in the project without git ever seeing them and without the user's own
+// .gitignore being touched.
 pub fn prepareTmpDir(alloc: std.mem.Allocator, io: std.Io, environ: *std.process.Environ.Map, root: []const u8) !void {
     const path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ root, tmp_subdir });
     std.Io.Dir.cwd().createDirPath(io, path) catch return;

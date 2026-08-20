@@ -78,6 +78,8 @@ pub const Config = struct {
     // Unioned into every session, after the named or detected shells so those
     // win on PATH.
     default: []const []const u8 = &.{},
+    // Binaries that show their access and ask before starting; "*" for every one.
+    confirm: []const []const u8 = &.{},
 
     // Enforced per-binary when a wrapped binary sandboxes itself; unioned into
     // the session profile under `moat shell`, where nesting cannot widen.
@@ -178,35 +180,12 @@ pub fn load(alloc: std.mem.Allocator, io: std.Io, home: []const u8) !Loaded {
     return .{ .config = cfg, .path = path };
 }
 
-pub fn readOverride(alloc: std.mem.Allocator, io: std.Io, dir_path: []const u8) !?[]const []const u8 {
-    var dir = std.Io.Dir.openDirAbsolute(io, dir_path, .{}) catch return null;
-    defer dir.close(io);
-    var buf: [4096]u8 = undefined;
-    // An unreadable .moat-shell is reported; only an absent one is "no override".
-    const content = dir.readFile(io, ".moat-shell", &buf) catch |err| switch (err) {
-        error.FileNotFound => return null,
-        else => {
-            std.debug.print("moat: cannot read {s}/.moat-shell: {s}\n", .{ dir_path, @errorName(err) });
-            return err;
-        },
-    };
-    var shells: std.ArrayList([]const u8) = .empty;
-    var lines = std.mem.splitScalar(u8, content, '\n');
-    while (lines.next()) |line| {
-        const trimmed = std.mem.trim(u8, line, &std.ascii.whitespace);
-        if (trimmed.len > 0) try shells.append(alloc, try alloc.dupe(u8, trimmed));
-    }
-    if (shells.items.len == 0) return null;
-    return shells.items;
-}
-
 pub const ResolveResult = struct {
     shells: []const []const u8,
-    source: enum { override, link, detect },
+    source: enum { link, detect },
 };
 
 pub fn resolve(alloc: std.mem.Allocator, io: std.Io, loaded: *const Loaded, dir_path: []const u8) !?ResolveResult {
-    if (try readOverride(alloc, io, dir_path)) |s| return .{ .shells = s, .source = .override };
     if (loaded.lookupLink(dir_path)) |s| return .{ .shells = s, .source = .link };
     if (try loaded.detectShells(alloc, io, dir_path)) |s| return .{ .shells = s, .source = .detect };
     return null;
@@ -228,7 +207,9 @@ pub fn saveConfig(alloc: std.mem.Allocator, io: std.Io, path: []const u8, cfg: C
         defer file.close(io);
         var buf: [4096]u8 = undefined;
         var w = file.writer(io, &buf);
-        try std.zon.stringify.serialize(cfg, .{}, &w.interface);
+        // Fields left at their default are omitted, so a rewritten config does
+        // not grow `.write = false` / `.dirs = .{}` on every rule.
+        try std.zon.stringify.serialize(cfg, .{ .emit_default_optional_fields = false }, &w.interface);
         try w.flush();
     }
     try std.Io.Dir.cwd().rename(tmp_path, std.Io.Dir.cwd(), path, io);
