@@ -35,11 +35,11 @@ pub fn parseMessage(msg: []const u8) ?Denial {
     return .{ .proc = proc, .pid = pid, .op = op, .path = path };
 }
 
-pub fn isFileOp(op: []const u8) bool {
+fn isFileOp(op: []const u8) bool {
     return std.mem.startsWith(u8, op, "file-");
 }
 
-pub fn isWriteOp(op: []const u8) bool {
+fn isWriteOp(op: []const u8) bool {
     return std.mem.startsWith(u8, op, "file-write");
 }
 

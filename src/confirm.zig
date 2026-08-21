@@ -67,15 +67,7 @@ pub fn render(alloc: std.mem.Allocator, req: Request) ![]u8 {
     try addLine(alloc, &buf, "  {s: <16} {s}\n", .{ "read/write/exec", req.root });
     if (req.env_home) |h| try addLine(alloc, &buf, "  {s: <16} {s}\n", .{ "HOME", h });
     for (req.grants) |g| {
-        const mode: []const u8 = if (g.write and g.exec)
-            "read/write/exec"
-        else if (g.write)
-            "read/write"
-        else if (g.exec)
-            "read/exec"
-        else
-            "read";
-        try addLine(alloc, &buf, "  {s: <16} {s}\n", .{ mode, g.path });
+        try addLine(alloc, &buf, "  {s: <16} {s}\n", .{ sandbox.accessLabel(g.write, g.exec), g.path });
     }
     for (req.jailbreaks) |j| {
         try addLine(alloc, &buf, "  {s: <16} {s}  UNSANDBOXED\n", .{ "jailbreak", j });

@@ -3,6 +3,7 @@ const config = @import("config.zig");
 const sandbox = @import("sandbox.zig");
 const confirm = @import("confirm.zig");
 const shell_env = @import("shell_env.zig");
+const env_mod = @import("env.zig");
 
 pub fn main(init: std.process.Init) !void {
     const alloc = init.gpa;
@@ -16,21 +17,18 @@ pub fn main(init: std.process.Init) !void {
     const manifest = readShareFile(alloc, io, share, "manifest") catch fatal("cannot read manifest") orelse fatal("cannot read manifest");
     const real_path = lookupManifest(manifest, exe_name) orelse fatal("not in manifest");
 
-    const root_env = init.environ_map.get("MOAT_ROOT") orelse fatal(
+    // Read (and duped) up front: the MOAT_ENV_* pass below mutates the map,
+    // whose put() frees the storage a borrowed slice would point at.
+    const env = try env_mod.from(alloc, init.environ_map);
+    const root = env.root orelse fatal(
         \\MOAT_ROOT not set
         \\  a wrapped binary needs the sandbox boundary, e.g.
         \\  MOAT_ROOT="$PWD" <binary>, or run it under `moat run -- <binary>`
     );
-    const home_env = init.environ_map.get("HOME") orelse fatal("HOME not set");
+    const home = env.home orelse fatal("HOME not set");
 
-    // Duped: put() below frees the old value storage these would borrow.
-    const root = try alloc.dupe(u8, root_env);
-    const home = try alloc.dupe(u8, home_env);
-
-    // Collect jailbreak list.
     var jailbreaks: std.ArrayList([]const u8) = .empty;
-    if (init.environ_map.get("MOAT_JAILBREAK")) |jb_borrowed| {
-        const jb = try alloc.dupe(u8, jb_borrowed);
+    if (env.jailbreak) |jb| {
         var it = std.mem.splitScalar(u8, jb, ':');
         while (it.next()) |path| {
             if (path.len > 0) try jailbreaks.append(alloc, path);
@@ -123,7 +121,7 @@ pub fn main(init: std.process.Init) !void {
 
         // Before apply: the summary names paths this process is about to lose
         // access to, and the approvals file lives under $HOME.
-        const mode = confirm.modeFromEnv(init.environ_map.get("MOAT_CONFIRM"));
+        const mode = confirm.modeFromEnv(env.confirm);
         if (confirm.required(loaded.config.confirm, exe_name, mode)) {
             confirm.ensure(alloc, io, .{
                 .bin = exe_name,

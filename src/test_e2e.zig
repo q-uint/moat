@@ -22,9 +22,9 @@ pub fn main(init: std.process.Init) !void {
         .{ "allow --exec", testAllowExec },
         .{ "allow merges same path", testAllowMergesSamePath },
         .{ "allow keeps dir-scoped rule", testAllowKeepsDirScopedRule },
-        .{ "unallow", testUnallow },
+        .{ "allow -r", testUnallow },
         .{ "link and detect", testLinkAndDetect },
-        .{ "unlink", testUnlink },
+        .{ "link -r", testUnlink },
         .{ "link relative path", testLinkRelative },
         .{ "detect rules (build.zig.zon)", testDetectRules },
         .{ "check", testCheck },
@@ -140,10 +140,9 @@ fn testUsageErrorsExitNonZero(alloc: std.mem.Allocator) !void {
     const cases: []const []const []const u8 = &.{
         &.{moat_path},
         &.{ moat_path, "shell" },
-        &.{ moat_path, "link" },
-        &.{ moat_path, "unlink" },
-        &.{ moat_path, "allow" },
+        &.{ moat_path, "link", "-r" },
         &.{ moat_path, "allow", "git" },
+        &.{ moat_path, "allow", "-r", "git" },
     };
     for (cases) |argv| {
         const result = try run(alloc, home.path, argv);
@@ -151,6 +150,13 @@ fn testUsageErrorsExitNonZero(alloc: std.mem.Allocator) !void {
             std.debug.print("    expected non-zero exit for: {s}\n", .{argv[argv.len - 1]});
             return error.ExpectedNonZeroExit;
         }
+    }
+
+    // The bare forms list instead of erroring, which is what lets one command
+    // per noun replace an add/remove pair.
+    for ([_][]const u8{ "allow", "link", "approvals" }) |cmd| {
+        const result = try run(alloc, home.path, &.{ moat_path, cmd });
+        if (!result.term.success()) return error.ExpectedZeroExit;
     }
 }
 
@@ -244,7 +250,7 @@ fn testUnallow(alloc: std.mem.Allocator) !void {
 
     // The shell-expanded form names the same rule as the stored tilde form.
     const expanded = try std.fmt.allocPrint(alloc, "{s}/.cache/zig", .{home.path});
-    const gone = try run(alloc, home.path, &.{ moat_path, "unallow", "zig", expanded });
+    const gone = try run(alloc, home.path, &.{ moat_path, "allow", "-r", "zig", expanded });
     if (!gone.term.success()) return error.UnallowFailed;
 
     const cfg_path = try std.fmt.allocPrint(alloc, "{s}/.config/moat/config.zon", .{home.path});
@@ -253,7 +259,7 @@ fn testUnallow(alloc: std.mem.Allocator) !void {
     if (std.mem.indexOf(u8, content, ".cache/zig") != null) return error.RuleStillPresent;
 
     // Removing what is not there must be detectable by exit status.
-    const again = try run(alloc, home.path, &.{ moat_path, "unallow", "zig", "~/.cache/zig" });
+    const again = try run(alloc, home.path, &.{ moat_path, "allow", "-r", "zig", "~/.cache/zig" });
     if (again.term.success()) return error.ExpectedNonZeroExit;
 }
 
@@ -276,7 +282,7 @@ fn testUnlink(alloc: std.mem.Allocator) !void {
     std.Io.Dir.cwd().createDirPath(io, dir) catch {};
 
     _ = try run(alloc, home.path, &.{ moat_path, "link", dir, "go" });
-    _ = try run(alloc, home.path, &.{ moat_path, "unlink", dir });
+    _ = try run(alloc, home.path, &.{ moat_path, "link", "-r", dir });
     const result = try run(alloc, home.path, &.{ moat_path, "detect", dir });
     try expectContains(result.stderr, "no shells detected");
 }

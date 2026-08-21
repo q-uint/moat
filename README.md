@@ -43,6 +43,7 @@ moat link . rust go               # associate current dir with shells
 moat detect                       # show what shells would activate
 moat approvals                    # list remembered confirm answers
 moat unapprove                    # forget them for this project
+moat update                       # move pinned shells to the current revision
 moat check                        # validate config (paths, shells, flake)
 moat -v shell rust                # verbose: show build progress
 ```
@@ -277,12 +278,17 @@ Inside `moat shell` the session profile is already active and the wrapper does n
 ## Development
 
 ```bash
-nix develop            # enter dev shell with zig
+nix develop            # enter dev shell with zig, pkg-config and nix.dev
 zig build              # build moat + moat-wrapper
 zig build test         # unit tests
 zig build e2e          # CLI integration tests (fast, no nix)
 zig build e2e-sandbox  # sandbox enforcement tests (requires nix)
+zig build bindings     # regenerate src/nix_c.zig from nix's C headers
 ```
+
+`moat` links nix's C API (`nix-flake-c` and its pkg-config dependencies) to lock flakes and realise store paths in process, so it never shells out to `nix`. `moat-wrapper` links none of it: the binary that runs inside the sandbox on every command depends only on libsandbox.
+
+The bindings in `src/nix_c.zig` are generated and committed, so a build needs neither the headers nor translate-c. That API is not stable yet, so `nix.tested_version` records what the bindings were generated against and moat says so at runtime if the linked version differs. After a nix upgrade, run `zig build bindings` and update that constant.
 
 ## License
 

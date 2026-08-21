@@ -13,18 +13,16 @@ const usage_text =
     \\usage:
     \\  moat shell [name...]         enter a sandboxed shell (detected if unnamed)
     \\  moat run [name...] -- <cmd>  run one command sandboxed, then exit
-    \\  moat allow <bin> <path>      grant a binary access to a path (--write, --exec)
-    \\  moat unallow <bin> <path>    remove a grant
+    \\  moat allow [bin path]        list grants, or add one (--write, --exec)
+    \\  moat link [dir name...]      list directory associations, or add one
     \\  moat approvals               list remembered confirm answers
-    \\  moat unapprove [dir]         forget them for a project (--all for every one)
-    \\  moat link <dir> <name...>    associate a directory with shell(s)
-    \\  moat unlink <dir>            remove a directory association
     \\  moat update [name...]        move pinned shells to the current revision
     \\  moat detect [dir]            show which shells would activate
     \\  moat check                   validate config (paths, shells)
     \\  moat help                    show this message
     \\
     \\flags:
+    \\  -r, --remove                 remove instead of add (allow, link, approvals)
     \\  -v, --verbose                show build progress
     \\  --trace                      report denied paths on exit (run only)
     \\
@@ -80,11 +78,8 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, command, "run")) return cmdRun(cmd_alloc, io, init.environ_map, env, rest.items, verbose, trace);
     if (std.mem.eql(u8, command, "update")) return cmdUpdate(cmd_alloc, io, home, env.flake, rest.items);
     if (std.mem.eql(u8, command, "allow")) return cmdAllow(cmd_alloc, io, home, rest.items);
-    if (std.mem.eql(u8, command, "unallow")) return cmdUnallow(cmd_alloc, io, home, rest.items);
-    if (std.mem.eql(u8, command, "approvals")) return cmdApprovals(cmd_alloc, io, home);
-    if (std.mem.eql(u8, command, "unapprove")) return cmdUnapprove(cmd_alloc, io, home, rest.items);
+    if (std.mem.eql(u8, command, "approvals")) return cmdApprovals(cmd_alloc, io, home, rest.items);
     if (std.mem.eql(u8, command, "link")) return cmdLink(cmd_alloc, io, home, rest.items);
-    if (std.mem.eql(u8, command, "unlink")) return cmdUnlink(cmd_alloc, io, home, rest.items);
     if (std.mem.eql(u8, command, "detect")) return cmdDetect(cmd_alloc, io, home, rest.items);
     if (std.mem.eql(u8, command, "check")) return cmdCheck(cmd_alloc, io, env);
     if (std.mem.eql(u8, command, "help")) return printUsage(io);
@@ -147,13 +142,6 @@ fn resolveRev(session: *NixSession, alloc: std.mem.Allocator, flake: []const u8)
     return n.rev(flake) orelse "";
 }
 
-// A shell name is either an attribute of MOAT_FLAKE or a qualified ref carrying
-// its own flake, so a shell someone shares needs no config to try.
-fn shellAttr(alloc: std.mem.Allocator, flake: []const u8, name: []const u8) ![]const u8 {
-    const parts = lock.split(name);
-    return std.fmt.allocPrint(alloc, "{s}#{s}", .{ parts.flake orelse flake, parts.attr });
-}
-
 // Builds from the locked ref when there is one, so a moving branch is followed
 // only by `moat update`. A recorded store path that still exists skips nix
 // entirely, which is also the fast path.
@@ -181,7 +169,7 @@ fn buildShell(session: *NixSession, alloc: std.mem.Allocator, io: std.Io, flake:
     const pinned = try lock.withRev(alloc, base, rev);
     const out = try nixBuild(session, alloc, pinned, parts.attr);
     if (rev.len > 0) {
-        std.debug.print("moat: pinned {s} to {s}\n", .{ name, rev[0..@min(rev.len, 12)] });
+        std.debug.print("moat: pinned {s} to {s}\n", .{ name, lock.shortRev(rev) });
     } else {
         std.debug.print("moat: {s} cannot be pinned ({s}); `moat update` will not help\n", .{ name, base });
     }
@@ -450,9 +438,54 @@ fn cmdRun(alloc: std.mem.Allocator, io: std.Io, environ: *std.process.Environ.Ma
     });
 }
 
-fn cmdAllow(alloc: std.mem.Allocator, io: std.Io, home: []const u8, args: []const []const u8) !void {
+// Pulls -r/--remove out of the argument list, so one command covers add, remove
+// and list instead of a pair of commands plus no way to see what is there.
+fn takeRemoveFlag(alloc: std.mem.Allocator, args: []const []const u8) !struct { remove: bool, rest: []const []const u8 } {
+    var rest: std.ArrayList([]const u8) = .empty;
+    var remove = false;
+    for (args) |a| {
+        if (std.mem.eql(u8, a, "-r") or std.mem.eql(u8, a, "--remove")) {
+            remove = true;
+        } else try rest.append(alloc, a);
+    }
+    return .{ .remove = remove, .rest = rest.items };
+}
+
+fn listAllow(alloc: std.mem.Allocator, io: std.Io, home: []const u8) !void {
+    const loaded = try config.load(alloc, io, home);
+    if (loaded.config.allow.len == 0) {
+        std.debug.print("no grants\n", .{});
+        return;
+    }
+    for (loaded.config.allow) |r| {
+        for (r.paths) |p| {
+            std.debug.print("  {s: <12} {s: <16} {s}", .{ r.bin, sandbox.accessLabel(r.write, r.exec), p });
+            if (r.dirs.len > 0) {
+                std.debug.print("  in", .{});
+                for (r.dirs) |d| std.debug.print(" {s}", .{d});
+            }
+            std.debug.print("\n", .{});
+        }
+    }
+    std.debug.print("{s}\n", .{loaded.path});
+}
+
+fn cmdAllow(alloc: std.mem.Allocator, io: std.Io, home: []const u8, argv: []const []const u8) !void {
+    const parsed = try takeRemoveFlag(alloc, argv);
+    const args = parsed.rest;
+    if (parsed.remove) {
+        if (args.len < 2) usageError("usage: moat allow -r <bin|*> <path>", .{});
+        const removed = try config.removeAllow(alloc, io, home, args[0], args[1]);
+        if (removed == 0) {
+            std.debug.print("moat: no rule for {s}: {s}\n", .{ args[0], args[1] });
+            std.process.exit(1);
+        }
+        std.debug.print("removed {s}: {s}\n", .{ args[0], args[1] });
+        return;
+    }
+    if (args.len == 0) return listAllow(alloc, io, home);
     if (args.len < 2) {
-        usageError("usage: moat allow <bin|*> <path> [--write]", .{});
+        usageError("usage: moat allow [<bin|*> <path> [--write] [--exec]]", .{});
     }
     var write = false;
     var exec = false;
@@ -461,7 +494,7 @@ fn cmdAllow(alloc: std.mem.Allocator, io: std.Io, home: []const u8, args: []cons
         if (std.mem.eql(u8, a, "--write")) write = true else if (std.mem.eql(u8, a, "--exec")) exec = true else path = a;
     }
     const target = path orelse {
-        usageError("usage: moat allow <bin|*> <path> [--write] [--exec]", .{});
+        usageError("usage: moat allow [<bin|*> <path> [--write] [--exec]]", .{});
     };
 
     // Stored unexpanded so the rule stays portable across machines.
@@ -484,20 +517,8 @@ fn cmdAllow(alloc: std.mem.Allocator, io: std.Io, home: []const u8, args: []cons
     }
     std.debug.print("  access       {s}{s}\n", .{ mode, ex });
     std.debug.print("  applies to   every project\n", .{});
-    std.debug.print("  remove       moat unallow {s} {s}\n", .{ args[0], target });
+    std.debug.print("  remove       moat allow -r {s} {s}\n", .{ args[0], target });
     std.debug.print("  config       {s}\n", .{granted.config_path});
-}
-
-fn cmdUnallow(alloc: std.mem.Allocator, io: std.Io, home: []const u8, args: []const []const u8) !void {
-    if (args.len < 2) {
-        usageError("usage: moat unallow <bin|*> <path>", .{});
-    }
-    const removed = try config.removeAllow(alloc, io, home, args[0], args[1]);
-    if (removed == 0) {
-        std.debug.print("moat: no rule for {s}: {s}\n", .{ args[0], args[1] });
-        std.process.exit(1);
-    }
-    std.debug.print("removed {s}: {s}\n", .{ args[0], args[1] });
 }
 
 // The only thing that moves a pin, so a moving branch is followed when you say
@@ -530,8 +551,8 @@ fn cmdUpdate(alloc: std.mem.Allocator, io: std.Io, home: []const u8, flake: []co
         } else {
             std.debug.print("  {s: <20} {s} -> {s}\n", .{
                 e.name,
-                if (e.rev.len > 0) e.rev[0..@min(e.rev.len, 12)] else "unpinned",
-                if (rev.len > 0) rev[0..@min(rev.len, 12)] else "unpinned",
+                lock.shortRev(e.rev),
+                lock.shortRev(rev),
             });
             changed += 1;
         }
@@ -541,7 +562,10 @@ fn cmdUpdate(alloc: std.mem.Allocator, io: std.Io, home: []const u8, flake: []co
     if (changed == 0) std.debug.print("nothing moved\n", .{});
 }
 
-fn cmdApprovals(alloc: std.mem.Allocator, io: std.Io, home: []const u8) !void {
+fn cmdApprovals(alloc: std.mem.Allocator, io: std.Io, home: []const u8, argv: []const []const u8) !void {
+    const parsed = try takeRemoveFlag(alloc, argv);
+    if (parsed.remove) return forgetApprovals(alloc, io, home, parsed.rest);
+
     const path = try confirm.approvalsPath(alloc, home);
     const entries = try confirm.parseEntries(alloc, try confirm.readApprovals(alloc, io, path));
     if (entries.len == 0) {
@@ -552,7 +576,7 @@ fn cmdApprovals(alloc: std.mem.Allocator, io: std.Io, home: []const u8) !void {
     std.debug.print("{s}\n", .{path});
 }
 
-fn cmdUnapprove(alloc: std.mem.Allocator, io: std.Io, home: []const u8, args: []const []const u8) !void {
+fn forgetApprovals(alloc: std.mem.Allocator, io: std.Io, home: []const u8, args: []const []const u8) !void {
     const all = args.len > 0 and std.mem.eql(u8, args[0], "--all");
     const target: ?[]const u8 = if (all)
         null
@@ -574,24 +598,35 @@ fn cmdUnapprove(alloc: std.mem.Allocator, io: std.Io, home: []const u8, args: []
     std.debug.print("dropped {d} approval(s) for {s}\n", .{ filtered.removed, target orelse "every project" });
 }
 
-fn cmdLink(alloc: std.mem.Allocator, io: std.Io, home: []const u8, args: []const []const u8) !void {
-    if (args.len < 2) {
-        usageError("usage: moat link <dir> <name...>", .{});
+fn cmdLink(alloc: std.mem.Allocator, io: std.Io, home: []const u8, argv: []const []const u8) !void {
+    const parsed = try takeRemoveFlag(alloc, argv);
+    const args = parsed.rest;
+    if (parsed.remove) {
+        if (args.len < 1) usageError("usage: moat link -r <dir>", .{});
+        const dir = try resolvePathArg(alloc, io, args[0]);
+        try config.removeLink(alloc, io, home, dir);
+        std.debug.print("unlinked {s}\n", .{dir});
+        return;
     }
+    if (args.len == 0) {
+        const loaded = try config.load(alloc, io, home);
+        if (loaded.config.links.len == 0) {
+            std.debug.print("no links\n", .{});
+            return;
+        }
+        for (loaded.config.links) |l| {
+            std.debug.print("  {s} ->", .{l.dir});
+            for (l.shells) |s| std.debug.print(" {s}", .{s});
+            std.debug.print("\n", .{});
+        }
+        return;
+    }
+    if (args.len < 2) usageError("usage: moat link [<dir> <name...>]", .{});
     const dir = try resolvePathArg(alloc, io, args[0]);
     try config.addLink(alloc, io, home, dir, args[1..]);
     std.debug.print("linked {s} ->", .{dir});
     for (args[1..]) |s| std.debug.print(" {s}", .{s});
     std.debug.print("\n", .{});
-}
-
-fn cmdUnlink(alloc: std.mem.Allocator, io: std.Io, home: []const u8, args: []const []const u8) !void {
-    if (args.len < 1) {
-        usageError("usage: moat unlink <dir>", .{});
-    }
-    const dir = try resolvePathArg(alloc, io, args[0]);
-    try config.removeLink(alloc, io, home, dir);
-    std.debug.print("unlinked {s}\n", .{dir});
 }
 
 fn resolvePathArg(alloc: std.mem.Allocator, io: std.Io, path: []const u8) ![]const u8 {
@@ -677,6 +712,15 @@ fn cmdCheck(alloc: std.mem.Allocator, io: std.Io, env: env_mod.Env) !void {
     var session: NixSession = .{};
     defer session.deinit();
     if (session.get(alloc)) |n| {
+        // Asking the store, not the filesystem: a path can exist on disk and
+        // still be invalid, which is exactly when a rebuild is needed.
+        const pins = lock.load(alloc, io, home) catch lock.Lock{};
+        for (pins.shells) |e| {
+            const short = lock.shortRev(e.rev);
+            const present = e.out.len > 0 and n.validPath(e.out);
+            std.debug.print("  pin: {s} at {s}{s}\n", .{ e.name, short, if (present) "" else " (not in store, will rebuild)" });
+        }
+
         if (n.evaluates(flake, null, nix.system)) {
             std.debug.print("  flake: {s} -- ok\n", .{flake});
         } else {
@@ -710,18 +754,6 @@ fn cmdCheck(alloc: std.mem.Allocator, io: std.Io, env: env_mod.Env) !void {
             std.debug.print("  allow: {s} dir {s} -- {s}\n", .{ r.bin, d, @errorName(err) });
             issues += 1;
         };
-    }
-
-    // A pin whose store path is gone still rebuilds from the same ref, so this
-    // is information rather than an issue.
-    const pins = lock.load(alloc, io, home) catch lock.Lock{};
-    for (pins.shells) |e| {
-        const short = if (e.rev.len > 0) e.rev[0..@min(e.rev.len, 12)] else "unpinned";
-        const present = if (e.out.len > 0) blk: {
-            std.Io.Dir.cwd().access(io, e.out, .{}) catch break :blk false;
-            break :blk true;
-        } else false;
-        std.debug.print("  pin: {s} at {s}{s}\n", .{ e.name, short, if (present) "" else " (not in store, will rebuild)" });
     }
 
     // Additive allows mean a wider rule makes a narrower one dead weight.

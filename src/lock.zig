@@ -25,6 +25,13 @@ pub const Lock = struct {
     }
 };
 
+// For display: a full hash is noise, and an empty rev means the source could
+// not be pinned at all.
+pub fn shortRev(rev: []const u8) []const u8 {
+    if (rev.len == 0) return "unpinned";
+    return rev[0..@min(rev.len, 12)];
+}
+
 // A working tree changes under you, so recording a rev for it would claim a
 // pin that does not exist.
 pub fn pinnable(flake: []const u8) bool {

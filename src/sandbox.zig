@@ -164,6 +164,14 @@ pub fn expandTilde(alloc: std.mem.Allocator, home: []const u8, path: []const u8)
     return try alloc.dupe(u8, path);
 }
 
+// One spelling of an access level, for anything that shows a grant to a person.
+pub fn accessLabel(write: bool, exec: bool) []const u8 {
+    if (write and exec) return "read/write/exec";
+    if (write) return "read/write";
+    if (exec) return "read/exec";
+    return "read";
+}
+
 pub const Grant = struct {
     path: []const u8,
     write: bool = false,

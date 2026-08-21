@@ -156,7 +156,7 @@ pub const Loaded = struct {
     }
 };
 
-pub fn configPath(alloc: std.mem.Allocator, home: []const u8) ![]const u8 {
+fn configPath(alloc: std.mem.Allocator, home: []const u8) ![]const u8 {
     return std.fmt.allocPrint(alloc, "{s}/.config/moat/config.zon", .{home});
 }
 
@@ -244,7 +244,6 @@ pub fn removeLink(alloc: std.mem.Allocator, io: std.Io, home: []const u8, dir: [
 // Allows are additive and there is no deny, so a second grant for a path can
 // only ever widen it. Rules scoped by `dirs` are a different scope and are left
 // alone.
-// Rules scoped by `dirs` are left alone, as in addAllow.
 pub fn removeAllow(alloc: std.mem.Allocator, io: std.Io, home: []const u8, bin: []const u8, path: []const u8) !usize {
     const loaded = try load(alloc, io, home);
     var rules: std.ArrayList(Config.AllowRule) = .empty;
